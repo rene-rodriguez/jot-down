@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/jot-down-logo.png" alt="jot-down — Terminal Markdown Notes" width="440">
+<img src="assets/jot-down-logo.png?v=2" alt="jot-down — Terminal Markdown Notes" width="380">
 
 <br>
 
