@@ -1,0 +1,4 @@
+/target
+
+# Serena MCP tooling (local project metadata, not part of the source tree)
+/.serena
