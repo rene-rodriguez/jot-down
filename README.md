@@ -1,6 +1,8 @@
 <div align="center">
 
-# jot-down
+<img src="assets/jot-down-logo.png" alt="jot-down — Terminal Markdown Notes" width="440">
+
+<br>
 
 **A fast, offline-first note-taking TUI for the terminal — built in Rust.**
 

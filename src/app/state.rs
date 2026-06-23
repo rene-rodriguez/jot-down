@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 
 use ratatui::widgets::ListState;
@@ -16,6 +16,8 @@ pub enum AppView {
     List,
     /// Viewing a note preview.
     Preview,
+    /// Typing a find-in-preview query (over the rendered preview).
+    PreviewSearch,
     /// Searching notes.
     Search,
     /// Asking a question answered from the notes (RAG).
@@ -110,6 +112,7 @@ pub struct SettingsForm {
     pub preview_definition_lists: bool,
     pub preview_custom_containers: bool,
     pub preview_linkify: bool,
+    pub preview_math: bool,
     /// Currently focused field (0..FIELD_COUNT).
     pub field: usize,
     /// True when shown as the first-run welcome (changes copy and Esc behaviour).
@@ -120,7 +123,7 @@ pub struct SettingsForm {
 
 impl SettingsForm {
     /// Number of editable rows in the form.
-    pub const FIELD_COUNT: usize = 23;
+    pub const FIELD_COUNT: usize = 24;
 
     /// The kind of the field at `index`.
     pub fn field_kind(index: usize) -> FieldKind {
@@ -128,7 +131,7 @@ impl SettingsForm {
             2 | 6 | 11 => FieldKind::Bool,
             7 => FieldKind::Choice,
             // Preview fields
-            12 | 14 | 15 | 16 | 17 | 19 | 20 | 21 | 22 => FieldKind::Bool,
+            12 | 14 | 15 | 16 | 17 | 19 | 20 | 21 | 22 | 23 => FieldKind::Bool,
             13 => FieldKind::Choice,
             _ => FieldKind::Text,
         }
@@ -164,6 +167,7 @@ impl SettingsForm {
             preview_definition_lists: s.preview.definition_lists,
             preview_custom_containers: s.preview.custom_containers,
             preview_linkify: s.preview.linkify,
+            preview_math: s.preview.math,
             field: 0,
             first_run: false,
             status: String::new(),
@@ -197,6 +201,7 @@ impl SettingsForm {
             20 => "Definition lists",
             21 => "Custom containers",
             22 => "Linkify URLs",
+            23 => "Unicode math",
             _ => "",
         }
     }
@@ -228,6 +233,7 @@ impl SettingsForm {
             20 => checkbox(self.preview_definition_lists),
             21 => checkbox(self.preview_custom_containers),
             22 => checkbox(self.preview_linkify),
+            23 => checkbox(self.preview_math),
             _ => String::new(),
         }
     }
@@ -283,6 +289,7 @@ impl SettingsForm {
             20 => self.preview_definition_lists = !self.preview_definition_lists,
             21 => self.preview_custom_containers = !self.preview_custom_containers,
             22 => self.preview_linkify = !self.preview_linkify,
+            23 => self.preview_math = !self.preview_math,
             _ => {}
         }
     }
@@ -413,6 +420,7 @@ impl SettingsForm {
         s.preview.definition_lists = self.preview_definition_lists;
         s.preview.custom_containers = self.preview_custom_containers;
         s.preview.linkify = self.preview_linkify;
+        s.preview.math = self.preview_math;
         Ok(())
     }
 }
@@ -519,6 +527,15 @@ pub struct AppState {
     /// View-only state: updated during rendering to keep the cursor on screen,
     /// hence `Cell` so it can be adjusted through a shared `&AppState`.
     pub editor_scroll: Cell<u16>,
+    /// When true, the body editor renders a live markdown preview beside it
+    /// (toggled with Ctrl+P). See `render_editor_preview` in the layout.
+    pub editor_preview_split: bool,
+    /// Vertical scroll offset (in rendered rows) of the editor's live preview.
+    /// Driven to follow the editor cursor's section; `Cell` for shared-ref use.
+    pub editor_preview_scroll: Cell<u16>,
+    /// Memoized render of `body_buffer` for the live preview, keyed by
+    /// (body hash, inner width). Avoids re-parsing markdown on every keystroke.
+    pub editor_preview_cache: RefCell<Option<(u64, u16, crate::tui::markdown::RenderOutput)>>,
     /// In-note find query (active in AppView::EditorSearch).
     pub editor_search_query: String,
     /// Byte offsets of current matches in body_buffer, ascending.
@@ -601,6 +618,32 @@ pub struct AppState {
     /// When set, the next preview render scrolls the focused code block into
     /// view. Cleared by the renderer once honored. View-only, hence `Cell`.
     pub preview_focus_scroll: Cell<bool>,
+    /// Headings of the last-rendered preview, with absolute preview rows. Powers
+    /// the outline overlay, jump-to-heading, and scrollbar ticks. Refreshed each
+    /// render, hence `RefCell` for interior mutability through a shared ref.
+    pub preview_headings: RefCell<Vec<crate::tui::markdown::Heading>>,
+    /// Whether the outline (jump-to-heading) overlay is open over the preview.
+    pub outline_open: bool,
+    /// Selected heading index in the outline overlay.
+    pub outline_selected: usize,
+    /// Find-in-preview query (matched case-insensitively against rendered text).
+    /// Stays set after confirming so `n`/`N` keep working in the preview.
+    pub preview_search_query: String,
+    /// Matches of the last render: (output row, char start, char end). Refreshed
+    /// each render so `n`/`N` can navigate against current positions.
+    pub preview_search_matches: RefCell<Vec<(usize, usize, usize)>>,
+    /// Index of the current find-in-preview match.
+    pub preview_search_idx: usize,
+    /// When set, the next preview render scrolls the current match into view.
+    /// Honored once by the renderer. View-only, hence `Cell`.
+    pub preview_search_scroll: Cell<bool>,
+    /// Heading indices whose sections are folded (collapsed) in the preview.
+    /// Cleared when the previewed note changes. Index-stable because folding
+    /// collapses content but never removes a heading from the rendered list.
+    pub folded_headings: RefCell<std::collections::HashSet<usize>>,
+    /// Whether the preview renders in zen mode: a narrower, centered reading
+    /// column (width from `settings.preview.zen_width`).
+    pub zen_mode: bool,
 }
 
 impl AppState {
@@ -618,6 +661,9 @@ impl AppState {
             cursor_pos: 0,
             wiki_complete: None,
             editor_scroll: Cell::new(0),
+            editor_preview_split: false,
+            editor_preview_scroll: Cell::new(0),
+            editor_preview_cache: RefCell::new(None),
             editor_search_query: String::new(),
             editor_search_matches: Vec::new(),
             editor_search_idx: 0,
@@ -657,6 +703,148 @@ impl AppState {
             preview_links: Vec::new(),
             preview_focus: None,
             preview_focus_scroll: Cell::new(false),
+            preview_headings: RefCell::new(Vec::new()),
+            outline_open: false,
+            outline_selected: 0,
+            preview_search_query: String::new(),
+            preview_search_matches: RefCell::new(Vec::new()),
+            preview_search_idx: 0,
+            preview_search_scroll: Cell::new(false),
+            folded_headings: RefCell::new(std::collections::HashSet::new()),
+            zen_mode: false,
+        }
+    }
+
+    /// Toggle zen (centered reading column) mode in the preview.
+    pub fn toggle_zen_mode(&mut self) {
+        self.zen_mode = !self.zen_mode;
+        let msg = if self.zen_mode {
+            "Zen reading on — w to exit"
+        } else {
+            "Zen reading off"
+        };
+        self.set_status(msg);
+    }
+
+    /// Toggle the fold of the section whose heading sits at or above the current
+    /// scroll. No-op when the previewed note has no headings.
+    pub fn toggle_fold_at_scroll(&mut self) {
+        if self.preview_headings.borrow().is_empty() {
+            self.set_status("No headings to fold");
+            return;
+        }
+        let idx = self.nearest_heading_to_scroll();
+        let mut folds = self.folded_headings.borrow_mut();
+        if !folds.insert(idx) {
+            folds.remove(&idx);
+        }
+    }
+
+    /// Fold every section, or unfold all if any are already folded.
+    pub fn toggle_fold_all(&mut self) {
+        let count = self.preview_headings.borrow().len();
+        if count == 0 {
+            self.set_status("No headings to fold");
+            return;
+        }
+        let mut folds = self.folded_headings.borrow_mut();
+        if folds.is_empty() {
+            *folds = (0..count).collect();
+        } else {
+            folds.clear();
+        }
+    }
+
+    /// Open find-in-preview: switch to the query input and start fresh.
+    pub fn open_preview_search(&mut self) {
+        self.view = AppView::PreviewSearch;
+        self.preview_search_query.clear();
+        self.preview_search_idx = 0;
+        self.preview_search_matches.borrow_mut().clear();
+    }
+
+    /// Append a character to the find query and re-seek from the first match.
+    pub fn preview_search_input(&mut self, c: char) {
+        self.preview_search_query.push(c);
+        self.preview_search_idx = 0;
+        self.preview_search_scroll.set(true);
+    }
+
+    /// Delete the last character of the find query.
+    pub fn preview_search_backspace(&mut self) {
+        self.preview_search_query.pop();
+        self.preview_search_idx = 0;
+        self.preview_search_scroll.set(true);
+    }
+
+    /// Confirm the find: keep the query highlighted and return to the preview so
+    /// `n`/`N` can step through matches.
+    pub fn confirm_preview_search(&mut self) {
+        self.view = AppView::Preview;
+    }
+
+    /// Cancel the find: clear the query and matches, return to the preview.
+    pub fn cancel_preview_search(&mut self) {
+        self.preview_search_query.clear();
+        self.preview_search_matches.borrow_mut().clear();
+        self.preview_search_idx = 0;
+        self.view = AppView::Preview;
+    }
+
+    /// Step to the next (`delta = 1`) or previous (`delta = -1`) find match,
+    /// wrapping around. No-op when there are no matches.
+    pub fn preview_search_step(&mut self, delta: i32) {
+        let total = self.preview_search_matches.borrow().len();
+        if total == 0 {
+            return;
+        }
+        let cur = self.preview_search_idx.min(total - 1) as i32;
+        self.preview_search_idx = (cur + delta).rem_euclid(total as i32) as usize;
+        self.preview_search_scroll.set(true);
+    }
+
+    /// Open the outline (jump-to-heading) overlay, selecting the heading nearest
+    /// at or above the current scroll. No-op if the note has no headings.
+    pub fn open_outline(&mut self) {
+        if self.preview_headings.borrow().is_empty() {
+            self.set_status("No headings in this note");
+            return;
+        }
+        self.outline_selected = self.nearest_heading_to_scroll();
+        self.outline_open = true;
+    }
+
+    /// Close the outline overlay.
+    pub fn close_outline(&mut self) {
+        self.outline_open = false;
+    }
+
+    /// Move the outline selection by `delta`, clamped to the heading range.
+    pub fn outline_move(&mut self, delta: i32) {
+        let count = self.preview_headings.borrow().len();
+        if count == 0 {
+            return;
+        }
+        let cur = self.outline_selected.min(count - 1) as i32;
+        self.outline_selected = (cur + delta).clamp(0, count as i32 - 1) as usize;
+    }
+
+    /// Index of the heading at or above the current preview scroll position.
+    fn nearest_heading_to_scroll(&self) -> usize {
+        let scroll = usize::from(self.preview_scroll.get());
+        self.preview_headings
+            .borrow()
+            .iter()
+            .rposition(|h| h.row <= scroll)
+            .unwrap_or(0)
+    }
+
+    /// Scroll the preview so the selected outline heading sits near the top.
+    pub fn jump_to_selected_heading(&self) {
+        let headings = self.preview_headings.borrow();
+        if let Some(h) = headings.get(self.outline_selected) {
+            let row = h.row.saturating_sub(1).min(usize::from(u16::MAX)) as u16;
+            self.preview_scroll.set(row);
         }
     }
 
@@ -667,6 +855,9 @@ impl AppState {
         if !self.focus_in_range() {
             self.preview_focus = None;
         }
+        // Fold state is keyed by heading index, which only stays meaningful for
+        // one note's headings; drop it when the previewed body changes.
+        self.folded_headings.borrow_mut().clear();
     }
 
     /// Clear the preview focus cursor (code block or link).
@@ -1531,6 +1722,114 @@ pub fn find_matches(haystack: &str, needle: &str) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outline_open_selects_nearest_and_jump_scrolls() {
+        use crate::tui::markdown::Heading;
+        let mut state = AppState::new();
+        *state.preview_headings.borrow_mut() = vec![
+            Heading { level: 1, text: "A".into(), row: 2 },
+            Heading { level: 2, text: "B".into(), row: 10 },
+            Heading { level: 1, text: "C".into(), row: 20 },
+        ];
+        state.preview_scroll.set(12);
+
+        // Opening selects the heading at or above the current scroll (row 10).
+        state.open_outline();
+        assert!(state.outline_open);
+        assert_eq!(state.outline_selected, 1);
+
+        // Movement is clamped to the heading range.
+        state.outline_move(1);
+        assert_eq!(state.outline_selected, 2);
+        state.outline_move(5);
+        assert_eq!(state.outline_selected, 2);
+        state.outline_move(-9);
+        assert_eq!(state.outline_selected, 0);
+
+        // Jump scrolls so the selected heading (row 2) sits near the top.
+        state.outline_selected = 2;
+        state.jump_to_selected_heading();
+        assert_eq!(state.preview_scroll.get(), 19);
+
+        state.close_outline();
+        assert!(!state.outline_open);
+    }
+
+    #[test]
+    fn open_outline_noops_without_headings() {
+        let mut state = AppState::new();
+        state.open_outline();
+        assert!(!state.outline_open);
+    }
+
+    #[test]
+    fn toggle_fold_marks_nearest_heading_and_fold_all() {
+        use crate::tui::markdown::Heading;
+        let mut state = AppState::new();
+        *state.preview_headings.borrow_mut() = vec![
+            Heading { level: 1, text: "A".into(), row: 0 },
+            Heading { level: 1, text: "B".into(), row: 10 },
+        ];
+        state.preview_scroll.set(12); // nearest at/above row 12 is heading 1
+
+        state.toggle_fold_at_scroll();
+        assert!(state.folded_headings.borrow().contains(&1));
+        state.toggle_fold_at_scroll(); // toggles back off
+        assert!(!state.folded_headings.borrow().contains(&1));
+
+        state.toggle_fold_all();
+        assert_eq!(state.folded_headings.borrow().len(), 2);
+        state.toggle_fold_all(); // any folded → clear all
+        assert!(state.folded_headings.borrow().is_empty());
+    }
+
+    #[test]
+    fn toggle_zen_mode_flips_state() {
+        let mut state = AppState::new();
+        assert!(!state.zen_mode);
+        state.toggle_zen_mode();
+        assert!(state.zen_mode);
+        state.toggle_zen_mode();
+        assert!(!state.zen_mode);
+    }
+
+    #[test]
+    fn refresh_code_blocks_clears_folds() {
+        let mut state = AppState::new();
+        state.folded_headings.borrow_mut().insert(0);
+        state.preview_body = "# A\n\nbody".to_string();
+        state.refresh_code_blocks();
+        assert!(state.folded_headings.borrow().is_empty());
+    }
+
+    #[test]
+    fn preview_search_step_wraps_around_matches() {
+        let mut state = AppState::new();
+        *state.preview_search_matches.borrow_mut() = vec![(0, 0, 1), (2, 0, 1), (5, 0, 1)];
+        state.preview_search_idx = 2;
+        state.preview_search_step(1); // wraps to the first match
+        assert_eq!(state.preview_search_idx, 0);
+        state.preview_search_step(-1); // wraps back to the last
+        assert_eq!(state.preview_search_idx, 2);
+        assert!(state.preview_search_scroll.get());
+    }
+
+    #[test]
+    fn preview_search_lifecycle_open_confirm_cancel() {
+        let mut state = AppState::new();
+        state.view = AppView::Preview;
+        state.open_preview_search();
+        assert_eq!(state.view, AppView::PreviewSearch);
+        state.preview_search_input('h');
+        state.preview_search_input('i');
+        assert_eq!(state.preview_search_query, "hi");
+        state.confirm_preview_search();
+        assert_eq!(state.view, AppView::Preview);
+        assert_eq!(state.preview_search_query, "hi"); // kept for n/N
+        state.cancel_preview_search();
+        assert!(state.preview_search_query.is_empty());
+    }
 
     #[test]
     fn palette_opens_filters_and_selects() {

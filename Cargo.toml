@@ -8,6 +8,9 @@ description = "A fast, offline-first terminal note-taking application"
 default = ["ai"]
 ai = ["dep:sqlite-vec", "dep:libsqlite3-sys", "dep:reqwest"]
 syntax-highlight = ["dep:syntect"]
+# Inline images: decode local image files and render them as half-block cells
+# in the preview (works in any terminal). Off by default to keep the binary lean.
+images = ["dep:image"]
 
 [dependencies]
 ratatui = "0.29"
@@ -28,6 +31,8 @@ rand = "0.8"
 pulldown-cmark = "0.10"
 phf = { version = "0.11", features = ["macros"] }
 syntect = { version = "5", optional = true, default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+# Inline images (optional): decode common formats; no default codecs we don't use.
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 # AI: statically embed the sqlite-vec extension and register it as a SQLite
 # auto-extension. libsqlite3-sys is pinned to sqlx 0.8's version so they share
 # one sqlite (auto-extension must apply to sqlx's connections).

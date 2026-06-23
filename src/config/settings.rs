@@ -107,6 +107,29 @@ pub struct PreviewConfig {
     #[serde(default = "default_wikilinks")]
     pub wikilinks: bool,
 
+    /// Convert `$…$` / `$$…$$` math to Unicode. Off by default so literal `$`
+    /// (e.g. prices) is preserved.
+    #[serde(default = "default_math")]
+    pub math: bool,
+
+    /// Column width for the preview's zen (centered reading) mode.
+    #[serde(default = "default_zen_width")]
+    pub zen_width: usize,
+
+    /// syntect theme name for code-block highlighting (only used in
+    /// `syntax-highlight` builds).
+    #[serde(default = "default_syntax_theme")]
+    pub syntax_theme: String,
+
+    /// Render local images inline as half-block cells (only used in `images`
+    /// builds).
+    #[serde(default = "default_images")]
+    pub images: bool,
+
+    /// Render fenced `mermaid` flowcharts as ASCII diagrams.
+    #[serde(default = "default_mermaid")]
+    pub mermaid: bool,
+
     /// Enable code-block actions in the preview (focus + copy).
     #[serde(default = "default_code_actions")]
     pub code_actions: bool,
@@ -133,6 +156,11 @@ impl Default for PreviewConfig {
             custom_containers: default_custom_containers(),
             linkify: default_linkify(),
             wikilinks: default_wikilinks(),
+            math: default_math(),
+            zen_width: default_zen_width(),
+            syntax_theme: default_syntax_theme(),
+            images: default_images(),
+            mermaid: default_mermaid(),
             code_actions: default_code_actions(),
             allow_run: default_allow_run(),
         }
@@ -341,6 +369,26 @@ fn default_linkify() -> bool {
 }
 
 fn default_wikilinks() -> bool {
+    true
+}
+
+fn default_math() -> bool {
+    false
+}
+
+fn default_zen_width() -> usize {
+    80
+}
+
+fn default_syntax_theme() -> String {
+    "base16-ocean.dark".to_string()
+}
+
+fn default_images() -> bool {
+    true
+}
+
+fn default_mermaid() -> bool {
     true
 }
 

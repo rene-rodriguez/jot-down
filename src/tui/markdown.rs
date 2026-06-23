@@ -28,7 +28,7 @@ use std::sync::OnceLock;
 pub use crate::config::LinkUrlMode;
 
 /// Options that affect preview rendering.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PreviewOptions {
     /// When false, markdown source is rendered as plain wrapped text.
     pub render_markdown: bool,
@@ -54,6 +54,20 @@ pub struct PreviewOptions {
     pub linkify: bool,
     /// Render `[[wikilinks]]` as styled internal links (live vs dangling).
     pub wikilinks: bool,
+    /// Convert `$…$` / `$$…$$` LaTeX-ish math to Unicode (Greek, symbols,
+    /// super/subscripts). Off by default — keep literal `$` (e.g. prices) intact.
+    pub math: bool,
+    /// Name of the syntect theme for code-block highlighting (only consulted in
+    /// `syntax-highlight` builds; falls back to `base16-ocean.dark`).
+    #[cfg_attr(not(feature = "syntax-highlight"), allow(dead_code))]
+    pub syntax_theme: String,
+    /// Render local images as half-block cells instead of a placeholder (only
+    /// honored in `images` builds).
+    #[cfg_attr(not(feature = "images"), allow(dead_code))]
+    pub images: bool,
+    /// Render fenced `mermaid` flowcharts as ASCII diagrams (falls back to the
+    /// raw source for unsupported diagram types).
+    pub mermaid: bool,
     /// Index of the fenced code block to highlight as "focused" (for the
     /// preview's code-block actions). `None` highlights nothing.
     pub focused_code_block: Option<usize>,
@@ -77,6 +91,10 @@ impl Default for PreviewOptions {
             custom_containers: true,
             linkify: false,
             wikilinks: false,
+            math: false,
+            syntax_theme: "base16-ocean.dark".to_string(),
+            images: false,
+            mermaid: true,
             focused_code_block: None,
             focused_wikilink: None,
         }
@@ -218,6 +236,36 @@ fn find_closing_fence(s: &str) -> Option<usize> {
     }
 }
 
+/// A heading collected during rendering, for outline / current-section features.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heading {
+    /// Heading level, 1–6.
+    pub level: u8,
+    /// Plain (unstyled) heading text.
+    pub text: String,
+    /// Index of this heading's first output row within `lines`.
+    pub row: usize,
+}
+
+/// Rich result of rendering markdown: the styled lines plus positional metadata
+/// the preview uses for code-block focus, cursor-synced scrolling, current-
+/// section highlighting, and outline navigation.
+#[derive(Debug, Clone, Default)]
+pub struct RenderOutput {
+    /// Styled, pre-wrapped output rows.
+    pub lines: Vec<Line<'static>>,
+    /// First output-row index of each fenced code block, in document order.
+    pub code_rows: Vec<usize>,
+    /// For each 0-based source line, the index of its first output row in
+    /// `lines`. Lets the editor map its cursor line to a preview row for synced
+    /// scrolling. Indexed against the pre-pass-transformed source, so it is exact
+    /// unless a line-count-changing pre-pass (abbreviations, definition lists,
+    /// custom containers) applies — those only shift the mapping approximately.
+    pub source_line_rows: Vec<usize>,
+    /// Headings in document order, for outline + current-section features.
+    pub headings: Vec<Heading>,
+}
+
 /// Render markdown source into styled, pre-wrapped Ratatui lines.
 pub fn render(source: &str, width: u16, opts: &PreviewOptions) -> Vec<Line<'static>> {
     render_with_code_rows(source, width, opts).0
@@ -231,7 +279,8 @@ pub fn render_with_code_rows(
     width: u16,
     opts: &PreviewOptions,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
-    render_full(source, width, opts, &std::collections::HashSet::new())
+    let out = render_full(source, width, opts, &std::collections::HashSet::new());
+    (out.lines, out.code_rows)
 }
 
 /// Like [`render_with_code_rows`], but with a `link_targets` set of normalized
@@ -243,16 +292,21 @@ pub fn render_full(
     width: u16,
     opts: &PreviewOptions,
     link_targets: &std::collections::HashSet<String>,
-) -> (Vec<Line<'static>>, Vec<usize>) {
+) -> RenderOutput {
     let width = usize::from(width.max(1));
     if !opts.render_markdown {
-        return (render_plain(source, width), Vec::new());
+        return RenderOutput {
+            lines: render_plain(source, width),
+            ..RenderOutput::default()
+        };
     }
 
     // Pre-passes (source-level transforms).
     let source = strip_abbreviations(source, opts.abbreviations);
     let source = strip_definition_lists(&source, opts.definition_lists);
     let source = convert_custom_containers(&source, opts.custom_containers);
+    let source = convert_github_callouts(&source, opts.custom_containers);
+    let source = convert_math(&source, opts.math);
 
     // Mask `[[wikilinks]]` into bracket-free sentinels before parsing, so they
     // survive pulldown's inline tokenizer; the renderer expands them back into
@@ -264,7 +318,7 @@ pub fn render_full(
         (source, Vec::new())
     };
 
-    Renderer::new(width, *opts, link_targets.clone(), wikilink_table).render(&source)
+    Renderer::new(width, opts.clone(), link_targets.clone(), wikilink_table).render(&source)
 }
 
 // ── Pre-passes ──────────────────────────────────────────────────────────────
@@ -438,6 +492,273 @@ fn convert_custom_containers(source: &str, enabled: bool) -> Cow<'_, str> {
     }
 }
 
+/// Convert GitHub-style alert blockquotes (`> [!NOTE]` followed by `>` lines)
+/// into the same HTML container markers as `:::` callouts, so they render
+/// through [`Renderer::finish_callout`]. Reuses the `custom_containers` toggle.
+fn convert_github_callouts(source: &str, enabled: bool) -> Cow<'_, str> {
+    if !enabled || !source.contains("[!") {
+        return Cow::Borrowed(source);
+    }
+
+    let lines: Vec<&str> = source.lines().collect();
+    let mut result = String::with_capacity(source.len());
+    let mut i = 0;
+    let mut changed = false;
+
+    while i < lines.len() {
+        if let Some(kind) = github_alert_kind(lines[i]) {
+            changed = true;
+            result.push_str("<!-- CUSTOM_CONTAINER_START:");
+            result.push_str(&kind);
+            result.push_str(" -->\n");
+            i += 1;
+            // The remaining `>`-prefixed lines are the callout body, de-quoted.
+            while i < lines.len() {
+                let t = lines[i].trim_start();
+                if let Some(rest) = t.strip_prefix('>') {
+                    result.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+                    result.push('\n');
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            result.push_str("<!-- CUSTOM_CONTAINER_END -->\n");
+        } else {
+            result.push_str(lines[i]);
+            result.push('\n');
+            i += 1;
+        }
+    }
+
+    if changed {
+        if !source.ends_with('\n') {
+            result.truncate(result.len().saturating_sub(1));
+        }
+        Cow::Owned(result)
+    } else {
+        Cow::Borrowed(source)
+    }
+}
+
+/// If `line` is a GitHub alert marker (`> [!NOTE]` alone on the line), return the
+/// lowercased alert type (`note`, `warning`, …).
+fn github_alert_kind(line: &str) -> Option<String> {
+    let after = line.trim_start().strip_prefix('>')?.trim();
+    let inner = after.strip_prefix("[!")?.strip_suffix(']')?;
+    if inner.is_empty() || !inner.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(inner.to_ascii_lowercase())
+}
+
+/// Convert `$…$` and `$$…$$` math spans to Unicode in source, skipping fenced
+/// code blocks and inline code. Uses the CommonMark-ish rule that an inline `$`
+/// pair must not have whitespace just inside the delimiters, so prices like
+/// "$5 and $10" are left untouched.
+fn convert_math(source: &str, enabled: bool) -> Cow<'_, str> {
+    if !enabled || !source.contains('$') {
+        return Cow::Borrowed(source);
+    }
+    let mut result = String::with_capacity(source.len());
+    let mut changed = false;
+    let mut in_fence = false;
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        } else if !in_fence {
+            let (converted, did) = convert_math_in_line(line);
+            changed |= did;
+            result.push_str(&converted);
+            result.push('\n');
+            continue;
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+    if changed {
+        if !source.ends_with('\n') {
+            result.truncate(result.len().saturating_sub(1));
+        }
+        Cow::Owned(result)
+    } else {
+        Cow::Borrowed(source)
+    }
+}
+
+/// Convert math spans within a single line, skipping inline-code (backtick)
+/// regions. Returns the rewritten line and whether anything changed.
+fn convert_math_in_line(line: &str) -> (String, bool) {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut changed = false;
+    let mut in_code = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '`' {
+            in_code = !in_code;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '$' && !in_code {
+            let double = chars.get(i + 1) == Some(&'$');
+            let content_start = i + if double { 2 } else { 1 };
+            // Inline `$` must not be immediately followed by whitespace.
+            let opens = double
+                || chars
+                    .get(content_start)
+                    .is_some_and(|c| !c.is_whitespace());
+            if opens {
+                if let Some((end, inner)) = find_math_close(&chars, content_start, double) {
+                    out.push_str(&latex_to_unicode(&inner));
+                    changed = true;
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    (out, changed)
+}
+
+/// Find the closing `$`/`$$` for a math span opened at `start`, returning the
+/// index just past the closer and the inner text. An inline closer must be
+/// preceded by a non-space and enclose non-empty content.
+fn find_math_close(chars: &[char], start: usize, double: bool) -> Option<(usize, String)> {
+    let mut j = start;
+    while j < chars.len() {
+        if double {
+            if chars[j] == '$' && chars.get(j + 1) == Some(&'$') {
+                return (j > start).then(|| (j + 2, chars[start..j].iter().collect()));
+            }
+        } else if chars[j] == '$' && j > start && !chars[j - 1].is_whitespace() {
+            return Some((j + 1, chars[start..j].iter().collect()));
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Translate a LaTeX-ish math fragment to Unicode: Greek/symbol commands,
+/// `^`/`_` super/subscripts (single char or `{group}`), and `\frac{a}{b}`.
+fn latex_to_unicode(inner: &str) -> String {
+    let chars: Vec<char> = inner.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                let name: String = chars[start..j].iter().collect();
+                if name == "frac" {
+                    let (num, k1) = read_brace_group(&chars, j);
+                    let (den, k2) = read_brace_group(&chars, k1);
+                    out.push_str(&latex_to_unicode(&num));
+                    out.push('⁄');
+                    out.push_str(&latex_to_unicode(&den));
+                    i = k2;
+                } else if let Some(sym) = latex_command(&name) {
+                    out.push_str(sym);
+                    i = j;
+                } else if name.is_empty() {
+                    // Backslash + non-letter (e.g. `\,` spacing, `\\`): thin space.
+                    out.push(' ');
+                    i = (j + 1).min(chars.len());
+                } else {
+                    out.push_str(&name);
+                    i = j;
+                }
+            }
+            '^' => {
+                let (grp, k) = read_brace_group(&chars, i + 1);
+                out.push_str(&to_superscript_str(&grp));
+                i = k;
+            }
+            '_' => {
+                let (grp, k) = read_brace_group(&chars, i + 1);
+                out.push_str(&to_subscript_str(&grp));
+                i = k;
+            }
+            '{' | '}' => i += 1, // strip stray braces
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Read a `{group}` (honoring nesting) or a single character starting at `pos`
+/// (skipping leading spaces). Returns the content and the index just past it.
+fn read_brace_group(chars: &[char], mut pos: usize) -> (String, usize) {
+    while pos < chars.len() && chars[pos] == ' ' {
+        pos += 1;
+    }
+    if chars.get(pos) == Some(&'{') {
+        let mut depth = 1;
+        pos += 1;
+        let start = pos;
+        while pos < chars.len() && depth > 0 {
+            match chars[pos] {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            pos += 1;
+        }
+        let content: String = chars[start..pos].iter().collect();
+        (content, (pos + 1).min(chars.len()))
+    } else if pos < chars.len() {
+        (chars[pos].to_string(), pos + 1)
+    } else {
+        (String::new(), pos)
+    }
+}
+
+/// Map a LaTeX command name (without the backslash) to its Unicode symbol.
+fn latex_command(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "alpha" => "α", "beta" => "β", "gamma" => "γ", "delta" => "δ",
+        "epsilon" => "ε", "zeta" => "ζ", "eta" => "η", "theta" => "θ",
+        "iota" => "ι", "kappa" => "κ", "lambda" => "λ", "mu" => "μ", "nu" => "ν",
+        "xi" => "ξ", "omicron" => "ο", "pi" => "π", "rho" => "ρ", "sigma" => "σ",
+        "tau" => "τ", "upsilon" => "υ", "phi" => "φ", "chi" => "χ", "psi" => "ψ",
+        "omega" => "ω",
+        "Gamma" => "Γ", "Delta" => "Δ", "Theta" => "Θ", "Lambda" => "Λ",
+        "Xi" => "Ξ", "Pi" => "Π", "Sigma" => "Σ", "Phi" => "Φ", "Psi" => "Ψ",
+        "Omega" => "Ω",
+        "times" => "×", "cdot" => "·", "div" => "÷", "pm" => "±", "mp" => "∓",
+        "leq" => "≤", "le" => "≤", "geq" => "≥", "ge" => "≥", "neq" => "≠",
+        "ne" => "≠", "approx" => "≈", "equiv" => "≡", "cong" => "≅",
+        "sim" => "∼", "propto" => "∝", "infty" => "∞", "partial" => "∂",
+        "nabla" => "∇", "sum" => "∑", "prod" => "∏", "int" => "∫", "sqrt" => "√",
+        "to" => "→", "rightarrow" => "→", "leftarrow" => "←",
+        "leftrightarrow" => "↔", "Rightarrow" => "⇒", "Leftarrow" => "⇐",
+        "in" => "∈", "notin" => "∉", "subset" => "⊂", "supset" => "⊃",
+        "subseteq" => "⊆", "supseteq" => "⊇", "cup" => "∪", "cap" => "∩",
+        "emptyset" => "∅", "forall" => "∀", "exists" => "∃", "angle" => "∠",
+        "cdots" => "⋯", "ldots" => "…", "dots" => "…", "perp" => "⊥",
+        "parallel" => "∥", "wedge" => "∧", "vee" => "∨", "neg" => "¬",
+        "oplus" => "⊕", "otimes" => "⊗", "circ" => "∘", "deg" => "°",
+        _ => return None,
+    })
+}
+
 fn render_plain(source: &str, width: usize) -> Vec<Line<'static>> {
     if source.is_empty() {
         return vec![Line::from("")];
@@ -504,6 +825,7 @@ struct Renderer {
     code_lang: Option<String>,
     link_url: Option<String>,
     image_alt: Option<String>,
+    image_url: Option<String>,
     footnotes: Vec<(String, Vec<Line<'static>>)>,
     /// Reference names in order of first appearance; index + 1 is the number.
     footnote_order: Vec<String>,
@@ -524,12 +846,28 @@ struct Renderer {
     code_block_index: usize,
     /// First output-row index of each flushed code block, in document order.
     code_block_rows: Vec<usize>,
+    /// Byte offset of each source line's start (sorted), to map an event's
+    /// source byte offset to a source line number.
+    line_starts: Vec<usize>,
+    /// For each source line, the output row it first emitted to. Built densely
+    /// (every source line gets an entry) as events stream in source order.
+    source_line_rows: Vec<usize>,
+    /// Next source line awaiting an entry in `source_line_rows`.
+    next_src_line: usize,
+    /// Headings collected in document order (level, text, output row).
+    headings: Vec<Heading>,
     /// Normalized titles of existing notes, for resolving `[[wikilinks]]` as
     /// live vs dangling. Empty unless `opts.wikilinks` is on.
     link_targets: std::collections::HashSet<String>,
     /// Wikilinks masked out of the source, indexed by the sentinel number; the
     /// `add_text` pass expands `\u{E000}<i>\u{E001}` back into styled spans.
     wikilink_table: Vec<crate::notes::wikilinks::WikiLink>,
+}
+
+/// Map a byte offset to its 0-based source line, given sorted line-start offsets
+/// (`line_starts[0]` is always 0). Used to attribute parser events to lines.
+fn line_of(line_starts: &[usize], byte: usize) -> usize {
+    line_starts.partition_point(|&s| s <= byte).saturating_sub(1)
 }
 
 impl Renderer {
@@ -554,6 +892,7 @@ impl Renderer {
             code_lang: None,
             link_url: None,
             image_alt: None,
+            image_url: None,
             footnotes: Vec::new(),
             footnote_order: Vec::new(),
             footnote_defs: Vec::new(),
@@ -567,12 +906,28 @@ impl Renderer {
             callout_lines: Vec::new(),
             code_block_index: 0,
             code_block_rows: Vec::new(),
+            line_starts: Vec::new(),
+            source_line_rows: Vec::new(),
+            next_src_line: 0,
+            headings: Vec::new(),
             link_targets,
             wikilink_table,
         }
     }
 
-    fn render(mut self, source: &str) -> (Vec<Line<'static>>, Vec<usize>) {
+    fn render(mut self, source: &str) -> RenderOutput {
+        // Byte offset of each source line start, so we can attribute each parser
+        // event to a source line (powers `source_line_rows`).
+        self.line_starts = std::iter::once(0)
+            .chain(
+                source
+                    .bytes()
+                    .enumerate()
+                    .filter(|&(_, b)| b == b'\n')
+                    .map(|(i, _)| i + 1),
+            )
+            .collect();
+
         let mut options = Options::empty();
         options.insert(Options::ENABLE_STRIKETHROUGH);
         options.insert(Options::ENABLE_TABLES);
@@ -584,7 +939,16 @@ impl Renderer {
             options.insert(Options::ENABLE_SMART_PUNCTUATION);
         }
 
-        for event in Parser::new_ext(source, options) {
+        for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+            // Record the output row where each source line first emits, in source
+            // order. The forward-only guard skips events whose range starts on an
+            // already-recorded line (e.g. End tags that span a whole block).
+            let line = line_of(&self.line_starts, range.start);
+            let row = self.lines.len();
+            while self.next_src_line <= line {
+                self.source_line_rows.push(row);
+                self.next_src_line += 1;
+            }
             match event {
                 Event::Start(tag) => self.start_tag(tag),
                 Event::End(tag) => self.end_tag(tag),
@@ -637,6 +1001,14 @@ impl Renderer {
             }
         }
 
+        // Any trailing source lines that emitted no events (e.g. a blank tail)
+        // map to the end of the body.
+        let end_row = self.lines.len();
+        while self.next_src_line < self.line_starts.len() {
+            self.source_line_rows.push(end_row);
+            self.next_src_line += 1;
+        }
+
         self.flush_line();
         self.render_footnote_defs();
         self.render_footnotes();
@@ -644,7 +1016,12 @@ impl Renderer {
         if self.lines.is_empty() {
             self.lines.push(Line::from(""));
         }
-        (self.lines, self.code_block_rows)
+        RenderOutput {
+            lines: self.lines,
+            code_rows: self.code_block_rows,
+            source_line_rows: self.source_line_rows,
+            headings: self.headings,
+        }
     }
 
     /// Handle block-level HTML from pre-passes (definition lists, custom containers).
@@ -774,9 +1151,11 @@ impl Renderer {
                     table.current_cell = String::new();
                 }
             }
-            Tag::Image { .. } => {
-                // Buffer alt text from subsequent Event::Text; emit placeholder on close.
+            Tag::Image { dest_url, .. } => {
+                // Buffer alt text from subsequent Event::Text; on close either
+                // render the image (in `images` builds) or emit a placeholder.
                 self.image_alt = Some(String::new());
+                self.image_url = Some(dest_url.into_string());
                 self.link_url = None;
             }
             Tag::FootnoteDefinition(name) => {
@@ -801,6 +1180,23 @@ impl Renderer {
                 }
             }
             TagEnd::Heading(level) => {
+                // Collect the heading (plain text + the row it lands on) for the
+                // outline and current-section features, before `flush_line`
+                // drains `current`.
+                let text: String = self
+                    .current
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
+                if !text.is_empty() {
+                    self.headings.push(Heading {
+                        level: heading_level_number(level),
+                        text,
+                        row: self.lines.len(),
+                    });
+                }
                 self.flush_line();
                 self.pop_style();
                 if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
@@ -878,19 +1274,38 @@ impl Renderer {
                 self.suppress_output = self.suppress_output.saturating_sub(1);
             }
             TagEnd::Image => {
-                if let Some(alt) = self.image_alt.take() {
-                    if self.is_suppressed() {
+                let alt = self.image_alt.take();
+                let url = self.image_url.take();
+                if self.is_suppressed() {
+                    return;
+                }
+                let Some(alt) = alt else {
+                    return;
+                };
+
+                // In `images` builds with the option on, try to render the file
+                // as half-block cells; fall through to the placeholder otherwise.
+                #[cfg(feature = "images")]
+                if self.opts.images {
+                    if let Some(img_lines) =
+                        url.as_deref().and_then(|u| images::render_image_lines(u, self.width))
+                    {
+                        self.flush_line();
+                        self.lines.extend(img_lines.iter().cloned());
                         return;
                     }
-                    let label = if alt.is_empty() { "image" } else { &alt };
-                    self.ensure_prefix();
-                    self.current.push(Span::styled(
-                        format!("🖼 {} ", label),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    ));
                 }
+                #[cfg(not(feature = "images"))]
+                let _ = &url;
+
+                let label = if alt.is_empty() { "image" } else { &alt };
+                self.ensure_prefix();
+                self.current.push(Span::styled(
+                    format!("🖼 {} ", label),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ));
             }
             _ => {}
         }
@@ -1157,30 +1572,45 @@ impl Renderer {
                 continue;
             }
 
-            // Check for ^superscript^ (only if enabled)
-            if self.opts.sup_sub && i + 2 <= len && chars[i] == '^' {
+            // ^superscript^ → Unicode superscript. Only open when a closing
+            // caret exists ahead, so a stray `^` stays literal.
+            if self.opts.sup_sub && chars[i] == '^' {
                 if active_sup {
-                    flush_buf(&mut buf, &mut spans, base_style);
+                    if !buf.is_empty() {
+                        spans.push(Span::styled(
+                            to_superscript_str(&std::mem::take(&mut buf)),
+                            base_style,
+                        ));
+                    }
                     active_sup = false;
-                } else {
+                    i += 1;
+                    continue;
+                } else if matches!(chars[i + 1..].iter().position(|&c| c == '^'), Some(p) if p > 0) {
                     flush_buf(&mut buf, &mut spans, base_style);
                     active_sup = true;
+                    i += 1;
+                    continue;
                 }
-                i += 1;
-                continue;
             }
 
-            // Check for ~subscript~ (only if enabled)
-            if self.opts.sup_sub && i + 2 <= len && chars[i] == '~' {
+            // ~subscript~ → Unicode subscript, same closing-marker rule.
+            if self.opts.sup_sub && chars[i] == '~' {
                 if active_sub {
-                    flush_buf(&mut buf, &mut spans, base_style);
+                    if !buf.is_empty() {
+                        spans.push(Span::styled(
+                            to_subscript_str(&std::mem::take(&mut buf)),
+                            base_style,
+                        ));
+                    }
                     active_sub = false;
-                } else {
+                    i += 1;
+                    continue;
+                } else if matches!(chars[i + 1..].iter().position(|&c| c == '~'), Some(p) if p > 0) {
                     flush_buf(&mut buf, &mut spans, base_style);
                     active_sub = true;
+                    i += 1;
+                    continue;
                 }
-                i += 1;
-                continue;
             }
 
             buf.push(chars[i]);
@@ -1247,6 +1677,21 @@ impl Renderer {
         let focused = self.opts.focused_code_block == Some(block_index);
         let (gutter, gutter_style) = code_gutter(focused);
 
+        // Mermaid flowcharts render as ASCII art when we can parse them; on any
+        // failure we fall through to showing the raw source below.
+        if self.opts.mermaid && lang.as_deref() == Some("mermaid") {
+            if let Some(diagram) = render_mermaid(&code, self.width) {
+                self.lines.push(Line::from(Span::styled(
+                    format!("{}mermaid", if focused { "▶ " } else { "" }),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+                self.lines.extend(diagram);
+                return;
+            }
+        }
+
         // Optional language label above the block.
         if let Some(ref lang) = lang {
             let marker = if focused { "▶ " } else { "" };
@@ -1264,7 +1709,13 @@ impl Renderer {
         // Syntax-highlighted path (feature-gated).
         #[cfg(feature = "syntax-highlight")]
         if let Some(ref lang) = lang {
-            let (ss, theme) = highlighter();
+            let (ss, ts) = highlighter();
+            let theme = ts
+                .themes
+                .get(self.opts.syntax_theme.as_str())
+                .or_else(|| ts.themes.get("base16-ocean.dark"))
+                .or_else(|| ts.themes.values().next())
+                .expect("syntect ships default themes");
             if let Some(syntax) = ss.find_syntax_by_token(lang) {
                 self.highlight_code_block(&code, ss, syntax, theme, gutter, gutter_style);
                 if code.ends_with('\n') {
@@ -1978,6 +2429,51 @@ fn to_superscript(n: usize) -> String {
         .collect()
 }
 
+/// The Unicode superscript form of `c`, if one exists (digits, common symbols,
+/// and most ASCII letters).
+fn superscript_char(c: char) -> Option<char> {
+    Some(match c {
+        '0' => '⁰', '1' => '¹', '2' => '²', '3' => '³', '4' => '⁴',
+        '5' => '⁵', '6' => '⁶', '7' => '⁷', '8' => '⁸', '9' => '⁹',
+        '+' => '⁺', '-' => '⁻', '=' => '⁼', '(' => '⁽', ')' => '⁾', 'n' => 'ⁿ',
+        'a' => 'ᵃ', 'b' => 'ᵇ', 'c' => 'ᶜ', 'd' => 'ᵈ', 'e' => 'ᵉ', 'f' => 'ᶠ',
+        'g' => 'ᵍ', 'h' => 'ʰ', 'i' => 'ⁱ', 'j' => 'ʲ', 'k' => 'ᵏ', 'l' => 'ˡ',
+        'm' => 'ᵐ', 'o' => 'ᵒ', 'p' => 'ᵖ', 'r' => 'ʳ', 's' => 'ˢ', 't' => 'ᵗ',
+        'u' => 'ᵘ', 'v' => 'ᵛ', 'w' => 'ʷ', 'x' => 'ˣ', 'y' => 'ʸ', 'z' => 'ᶻ',
+        'A' => 'ᴬ', 'B' => 'ᴮ', 'D' => 'ᴰ', 'E' => 'ᴱ', 'G' => 'ᴳ', 'H' => 'ᴴ',
+        'I' => 'ᴵ', 'J' => 'ᴶ', 'K' => 'ᴷ', 'L' => 'ᴸ', 'M' => 'ᴹ', 'N' => 'ᴺ',
+        'O' => 'ᴼ', 'P' => 'ᴾ', 'R' => 'ᴿ', 'T' => 'ᵀ', 'U' => 'ᵁ', 'V' => 'ⱽ',
+        'W' => 'ᵂ',
+        _ => return None,
+    })
+}
+
+/// The Unicode subscript form of `c`, if one exists (digits, common symbols, and
+/// the limited set of subscript letters Unicode provides).
+fn subscript_char(c: char) -> Option<char> {
+    Some(match c {
+        '0' => '₀', '1' => '₁', '2' => '₂', '3' => '₃', '4' => '₄',
+        '5' => '₅', '6' => '₆', '7' => '₇', '8' => '₈', '9' => '₉',
+        '+' => '₊', '-' => '₋', '=' => '₌', '(' => '₍', ')' => '₎',
+        'a' => 'ₐ', 'e' => 'ₑ', 'h' => 'ₕ', 'i' => 'ᵢ', 'j' => 'ⱼ', 'k' => 'ₖ',
+        'l' => 'ₗ', 'm' => 'ₘ', 'n' => 'ₙ', 'o' => 'ₒ', 'p' => 'ₚ', 'r' => 'ᵣ',
+        's' => 'ₛ', 't' => 'ₜ', 'u' => 'ᵤ', 'v' => 'ᵥ', 'x' => 'ₓ',
+        _ => return None,
+    })
+}
+
+/// Map every character of `s` to its Unicode superscript form, leaving
+/// unmappable characters unchanged.
+fn to_superscript_str(s: &str) -> String {
+    s.chars().map(|c| superscript_char(c).unwrap_or(c)).collect()
+}
+
+/// Map every character of `s` to its Unicode subscript form, leaving unmappable
+/// characters unchanged.
+fn to_subscript_str(s: &str) -> String {
+    s.chars().map(|c| subscript_char(c).unwrap_or(c)).collect()
+}
+
 /// Pad `text` to `width` columns according to `align` (None/Left → left).
 fn pad(text: &str, width: usize, align: Alignment) -> String {
     let len = text.chars().count();
@@ -2018,15 +2514,543 @@ fn heading_level_number(level: HeadingLevel) -> u8 {
 
 /// Build syntect's syntax set and theme once (lazy).
 #[cfg(feature = "syntax-highlight")]
-fn highlighter() -> &'static (syntect::parsing::SyntaxSet, syntect::highlighting::Theme) {
-    static H: OnceLock<(syntect::parsing::SyntaxSet, syntect::highlighting::Theme)> =
+fn highlighter() -> &'static (syntect::parsing::SyntaxSet, syntect::highlighting::ThemeSet) {
+    static H: OnceLock<(syntect::parsing::SyntaxSet, syntect::highlighting::ThemeSet)> =
         OnceLock::new();
     H.get_or_init(|| {
         let ss = syntect::parsing::SyntaxSet::load_defaults_newlines();
         let ts = syntect::highlighting::ThemeSet::load_defaults();
-        let theme = ts.themes["base16-ocean.dark"].clone();
-        (ss, theme)
+        (ss, ts)
     })
+}
+
+/// Render a fenced `mermaid` flowchart as ASCII art, or `None` if it isn't a
+/// flowchart we can lay out (the caller then shows the raw source).
+fn render_mermaid(code: &str, width: usize) -> Option<Vec<Line<'static>>> {
+    let fc = mermaid::parse(code)?;
+    Some(mermaid::render(&fc, width))
+}
+
+/// Minimal Mermaid flowchart support: parse `graph`/`flowchart` node/edge
+/// statements and render them as box-drawing ASCII — a vertical boxed flow for
+/// simple linear charts, an arrow edge-list for branching ones. Pure Rust.
+mod mermaid {
+    use super::*;
+    use std::collections::HashMap;
+
+    pub struct Node {
+        pub id: String,
+        pub label: String,
+    }
+    pub struct Edge {
+        pub from: String,
+        pub to: String,
+        pub label: Option<String>,
+    }
+    pub struct Flowchart {
+        pub nodes: Vec<Node>,
+        pub edges: Vec<Edge>,
+    }
+
+    enum Tok {
+        Node(String, Option<String>),
+        Arrow(bool), // has an arrowhead (`>`/`<`)
+        Pipe(String),
+    }
+
+    /// Parse a mermaid flowchart, or `None` if the header isn't `graph` /
+    /// `flowchart` or nothing usable is found.
+    pub fn parse(code: &str) -> Option<Flowchart> {
+        let raw: Vec<&str> = code
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("%%"))
+            .collect();
+        let header = raw.first()?.to_ascii_lowercase();
+        if !(header.starts_with("graph") || header.starts_with("flowchart")) {
+            return None;
+        }
+
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut edges: Vec<Edge> = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+
+        for line in &raw[1..] {
+            for stmt in line.split(';') {
+                let stmt = stmt.trim();
+                if stmt.is_empty() || skip_statement(stmt) {
+                    continue;
+                }
+                parse_statement(stmt, &mut nodes, &mut edges, &mut seen);
+            }
+        }
+
+        if nodes.is_empty() {
+            return None;
+        }
+        Some(Flowchart { nodes, edges })
+    }
+
+    /// Lines that are valid mermaid but not node/edge statements we render.
+    fn skip_statement(stmt: &str) -> bool {
+        let first = stmt.split_whitespace().next().unwrap_or("");
+        matches!(
+            first,
+            "subgraph" | "end" | "direction" | "style" | "classDef" | "class" | "click"
+                | "linkStyle"
+        )
+    }
+
+    fn ensure_node(
+        nodes: &mut Vec<Node>,
+        seen: &mut HashMap<String, usize>,
+        id: &str,
+        label: Option<String>,
+    ) {
+        if let Some(&i) = seen.get(id) {
+            if let Some(l) = label {
+                if !l.is_empty() {
+                    nodes[i].label = l;
+                }
+            }
+        } else {
+            let label = label.filter(|l| !l.is_empty()).unwrap_or_else(|| id.to_string());
+            seen.insert(id.to_string(), nodes.len());
+            nodes.push(Node {
+                id: id.to_string(),
+                label,
+            });
+        }
+    }
+
+    fn parse_statement(
+        stmt: &str,
+        nodes: &mut Vec<Node>,
+        edges: &mut Vec<Edge>,
+        seen: &mut HashMap<String, usize>,
+    ) {
+        let toks = tokenize(stmt);
+        let mut prev: Option<String> = None;
+        let mut pending_label: Option<String> = None;
+        let mut i = 0;
+        while i < toks.len() {
+            match &toks[i] {
+                Tok::Node(id, label) => {
+                    ensure_node(nodes, seen, id, label.clone());
+                    if let Some(from) = prev.take() {
+                        edges.push(Edge {
+                            from,
+                            to: id.clone(),
+                            label: pending_label.take(),
+                        });
+                    }
+                    prev = Some(id.clone());
+                }
+                Tok::Arrow(head) => {
+                    // Inline edge label: `A -- text --> B` tokenizes as
+                    // Arrow(no head), Node(text), Arrow(head); fold the middle
+                    // node into this edge's label.
+                    if !head {
+                        if let (Some(Tok::Node(lbl, None)), Some(Tok::Arrow(true))) =
+                            (toks.get(i + 1), toks.get(i + 2))
+                        {
+                            pending_label = Some(lbl.clone());
+                            i += 2;
+                        }
+                    }
+                }
+                Tok::Pipe(label) => pending_label = Some(label.clone()),
+            }
+            i += 1;
+        }
+    }
+
+    fn tokenize(stmt: &str) -> Vec<Tok> {
+        let chars: Vec<char> = stmt.chars().collect();
+        let mut toks = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c.is_whitespace() {
+                i += 1;
+            } else if c == '|' {
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j] != '|' {
+                    j += 1;
+                }
+                toks.push(Tok::Pipe(chars[start..j].iter().collect::<String>().trim().to_string()));
+                i = (j + 1).min(chars.len());
+            } else if matches!(c, '-' | '=' | '.' | '>' | '<') {
+                let mut j = i;
+                let mut head = false;
+                while j < chars.len() && matches!(chars[j], '-' | '=' | '.' | '>' | '<') {
+                    head |= matches!(chars[j], '>' | '<');
+                    j += 1;
+                }
+                toks.push(Tok::Arrow(head));
+                i = j;
+            } else if c.is_alphanumeric() || c == '_' {
+                let start = i;
+                let mut j = i;
+                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let id: String = chars[start..j].iter().collect();
+                let (label, k) = read_shape(&chars, j);
+                toks.push(Tok::Node(id, label));
+                i = k;
+            } else {
+                i += 1;
+            }
+        }
+        toks
+    }
+
+    /// Read a node-shape group (`[x]`, `(x)`, `{x}`, `((x))`, `([x])`, …) after
+    /// an id, returning its inner label. Tolerant: skips repeated open/close
+    /// brackets and takes the text between.
+    fn read_shape(chars: &[char], pos: usize) -> (Option<String>, usize) {
+        if !matches!(chars.get(pos), Some('[' | '(' | '{')) {
+            return (None, pos);
+        }
+        let mut j = pos;
+        while matches!(chars.get(j), Some('[' | '(' | '{')) {
+            j += 1;
+        }
+        let start = j;
+        while j < chars.len() && !matches!(chars[j], ']' | ')' | '}') {
+            j += 1;
+        }
+        let inner: String = chars[start..j].iter().collect();
+        while matches!(chars.get(j), Some(']' | ')' | '}')) {
+            j += 1;
+        }
+        (Some(inner.trim().to_string()), j)
+    }
+
+    /// Render a parsed flowchart to styled lines.
+    pub fn render(fc: &Flowchart, width: usize) -> Vec<Line<'static>> {
+        if let Some(order) = linear_order(fc) {
+            render_linear(fc, &order, width)
+        } else {
+            render_edge_list(fc, width)
+        }
+    }
+
+    /// If the chart is a single A→B→C path, return the node ids in order.
+    fn linear_order(fc: &Flowchart) -> Option<Vec<String>> {
+        if fc.nodes.len() < 2 || fc.edges.len() != fc.nodes.len() - 1 {
+            return None;
+        }
+        let mut out: HashMap<&str, usize> = HashMap::new();
+        let mut inc: HashMap<&str, usize> = HashMap::new();
+        let mut next: HashMap<&str, &str> = HashMap::new();
+        for e in &fc.edges {
+            *out.entry(&e.from).or_default() += 1;
+            *inc.entry(&e.to).or_default() += 1;
+            next.insert(&e.from, &e.to);
+        }
+        if out.values().any(|&v| v > 1) || inc.values().any(|&v| v > 1) {
+            return None;
+        }
+        let start = fc.nodes.iter().find(|n| !inc.contains_key(n.id.as_str()))?;
+        let mut order = vec![start.id.clone()];
+        let mut cur = start.id.as_str();
+        while let Some(&nx) = next.get(cur) {
+            order.push(nx.to_string());
+            cur = nx;
+        }
+        (order.len() == fc.nodes.len()).then_some(order)
+    }
+
+    fn label_of<'a>(fc: &'a Flowchart, id: &str) -> &'a str {
+        fc.nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.label.as_str())
+            .unwrap_or("?")
+    }
+
+    fn truncate(s: &str, max: usize) -> String {
+        let max = max.max(3);
+        if s.chars().count() <= max {
+            s.to_string()
+        } else {
+            let keep: String = s.chars().take(max - 1).collect();
+            format!("{keep}…")
+        }
+    }
+
+    fn render_linear(fc: &Flowchart, order: &[String], width: usize) -> Vec<Line<'static>> {
+        let box_style = Style::default().fg(Color::Cyan);
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut lines = Vec::new();
+        let label_cap = width.saturating_sub(6).max(3);
+
+        // Edge labels keyed by source id (linear → one out-edge per node).
+        let edge_label: HashMap<&str, &str> = fc
+            .edges
+            .iter()
+            .filter_map(|e| e.label.as_deref().map(|l| (e.from.as_str(), l)))
+            .collect();
+
+        for (idx, id) in order.iter().enumerate() {
+            let label = truncate(label_of(fc, id), label_cap);
+            let inner_w = label.chars().count();
+            let bar = "─".repeat(inner_w + 2);
+            let center = inner_w / 2 + 1; // column of the box's center
+            lines.push(Line::from(Span::styled(format!("┌{bar}┐"), box_style)));
+            lines.push(Line::from(Span::styled(format!("│ {label} │"), box_style)));
+            lines.push(Line::from(Span::styled(format!("└{bar}┘"), box_style)));
+
+            if idx + 1 < order.len() {
+                let pad = " ".repeat(center);
+                lines.push(Line::from(Span::styled(format!("{pad}│"), dim)));
+                let tail = match edge_label.get(id.as_str()) {
+                    Some(l) => format!("{pad}▼ {}", truncate(l, label_cap)),
+                    None => format!("{pad}▼"),
+                };
+                lines.push(Line::from(Span::styled(tail, dim)));
+            }
+        }
+        lines
+    }
+
+    fn render_edge_list(fc: &Flowchart, width: usize) -> Vec<Line<'static>> {
+        let arrow_style = Style::default().fg(Color::Cyan);
+        let dim = Style::default().fg(Color::DarkGray);
+        let label_cap = (width / 2).max(6);
+        let mut lines = Vec::new();
+
+        for e in &fc.edges {
+            let from = truncate(label_of(fc, &e.from), label_cap);
+            let to = truncate(label_of(fc, &e.to), label_cap);
+            let mid = match e.label.as_deref() {
+                Some(l) if !l.is_empty() => format!(" ──{}──▶ ", truncate(l, label_cap)),
+                _ => " ──▶ ".to_string(),
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {from}")),
+                Span::styled(mid, arrow_style),
+                Span::raw(to),
+            ]));
+        }
+
+        // Nodes that appear in no edge are listed on their own.
+        let connected: std::collections::HashSet<&str> = fc
+            .edges
+            .iter()
+            .flat_map(|e| [e.from.as_str(), e.to.as_str()])
+            .collect();
+        for n in &fc.nodes {
+            if !connected.contains(n.id.as_str()) {
+                lines.push(Line::from(vec![
+                    Span::styled("  • ", dim),
+                    Span::raw(truncate(&n.label, label_cap)),
+                ]));
+            }
+        }
+        lines
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn plain(lines: &[Line]) -> String {
+            lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        #[test]
+        fn non_flowchart_returns_none() {
+            assert!(parse("sequenceDiagram\n A->>B: hi").is_none());
+            assert!(parse("not mermaid at all").is_none());
+        }
+
+        #[test]
+        fn linear_chain_renders_boxed_flow() {
+            let fc = parse("graph TD\n A[Start] --> B[Work]\n B --> C[Done]").unwrap();
+            assert_eq!(fc.nodes.len(), 3);
+            assert_eq!(fc.edges.len(), 2);
+            let out = plain(&render(&fc, 40));
+            assert!(out.contains("Start") && out.contains("Work") && out.contains("Done"));
+            assert!(out.contains('┌') && out.contains("▼"), "boxed flow: {out}");
+        }
+
+        #[test]
+        fn edge_labels_parsed_pipe_and_inline() {
+            let fc = parse("flowchart TD\n A -->|yes| B\n A -- no --> C").unwrap();
+            // A has two out-edges → branching → edge list.
+            let out = plain(&render(&fc, 60));
+            assert!(out.contains("yes"), "pipe label: {out}");
+            assert!(out.contains("no"), "inline label: {out}");
+            assert!(out.contains("▶"));
+        }
+
+        #[test]
+        fn branching_uses_edge_list() {
+            let fc = parse("graph LR\n A --> B\n A --> C").unwrap();
+            assert!(linear_order(&fc).is_none());
+            let out = plain(&render(&fc, 40));
+            assert_eq!(out.matches("▶").count(), 2);
+        }
+    }
+}
+
+/// Inline image rendering: decode local image files and convert them to
+/// half-block (`▀`/`▄`) cells that flow as normal lines in the preview, so they
+/// scroll and clip like text and work in any terminal. Feature-gated.
+#[cfg(feature = "images")]
+mod images {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    type Cache = Mutex<HashMap<(String, usize), Option<Arc<Vec<Line<'static>>>>>>;
+
+    fn cache() -> &'static Cache {
+        static C: OnceLock<Cache> = OnceLock::new();
+        C.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Resolve a markdown image destination to a local file path, expanding a
+    /// leading `~`. Returns `None` for remote / `data:` URLs or empty input.
+    pub fn resolve_image_path(dest: &str) -> Option<std::path::PathBuf> {
+        let d = dest.trim();
+        if d.is_empty()
+            || d.starts_with("http://")
+            || d.starts_with("https://")
+            || d.starts_with("data:")
+        {
+            return None;
+        }
+        if let Some(rest) = d.strip_prefix("~/") {
+            Some(home_dir()?.join(rest))
+        } else if d == "~" {
+            home_dir()
+        } else {
+            Some(std::path::PathBuf::from(d))
+        }
+    }
+
+    fn home_dir() -> Option<std::path::PathBuf> {
+        std::env::var_os("HOME").map(std::path::PathBuf::from)
+    }
+
+    /// Render an image destination to cached half-block lines at `width` cells.
+    /// Failures (missing file, decode error, remote URL) are cached as `None` so
+    /// the per-frame preview doesn't retry them.
+    pub fn render_image_lines(dest: &str, width: usize) -> Option<Arc<Vec<Line<'static>>>> {
+        let path = resolve_image_path(dest)?;
+        let key = (path.to_string_lossy().into_owned(), width);
+        let mut guard = cache().lock().ok()?;
+        if let Some(hit) = guard.get(&key) {
+            return hit.clone();
+        }
+        let rendered = image::open(&path)
+            .ok()
+            .map(|img| Arc::new(image_to_halfblock_lines(&img, width, 24)));
+        guard.insert(key, rendered.clone());
+        rendered
+    }
+
+    /// Convert an image to half-block lines: each cell is `▀` with the top pixel
+    /// as foreground and the bottom pixel as background, so one text row shows
+    /// two pixel rows. Width is in cells; height is capped at `max_h_cells`.
+    pub fn image_to_halfblock_lines(
+        img: &image::DynamicImage,
+        max_w: usize,
+        max_h_cells: usize,
+    ) -> Vec<Line<'static>> {
+        use image::GenericImageView;
+        let (iw, ih) = img.dimensions();
+        if iw == 0 || ih == 0 || max_w == 0 {
+            return Vec::new();
+        }
+        let cols = max_w as u32;
+        let mut px_w = cols;
+        let mut px_h = (px_w * ih / iw).max(1);
+        let max_px_h = (max_h_cells.max(1) as u32) * 2;
+        if px_h > max_px_h {
+            px_h = max_px_h;
+            px_w = (px_h * iw / ih).max(1).min(cols);
+        }
+        let rgba = img
+            .resize_exact(px_w, px_h, image::imageops::FilterType::Triangle)
+            .to_rgba8();
+
+        let mut lines = Vec::with_capacity((px_h as usize).div_ceil(2));
+        let mut y = 0;
+        while y < px_h {
+            let mut spans = Vec::with_capacity(px_w as usize);
+            for x in 0..px_w {
+                let top = rgba.get_pixel(x, y).0;
+                let bottom = if y + 1 < px_h {
+                    rgba.get_pixel(x, y + 1).0
+                } else {
+                    [0, 0, 0, 0]
+                };
+                spans.push(half_block_span(top, bottom));
+            }
+            lines.push(Line::from(spans));
+            y += 2;
+        }
+        lines
+    }
+
+    /// A single half-block cell for a (top, bottom) RGBA pixel pair, honoring
+    /// transparency by leaving the corresponding half the terminal default.
+    fn half_block_span(top: [u8; 4], bottom: [u8; 4]) -> Span<'static> {
+        let top_opaque = top[3] > 16;
+        let bottom_opaque = bottom[3] > 16;
+        let top_fg = Color::Rgb(top[0], top[1], top[2]);
+        let bottom_fg = Color::Rgb(bottom[0], bottom[1], bottom[2]);
+        match (top_opaque, bottom_opaque) {
+            (true, true) => Span::styled("▀", Style::default().fg(top_fg).bg(bottom_fg)),
+            (true, false) => Span::styled("▀", Style::default().fg(top_fg)),
+            (false, true) => Span::styled("▄", Style::default().fg(bottom_fg)),
+            (false, false) => Span::raw(" "),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn resolve_skips_remote_and_expands_home() {
+            assert!(resolve_image_path("https://example.com/a.png").is_none());
+            assert!(resolve_image_path("  ").is_none());
+            assert_eq!(
+                resolve_image_path("/abs/a.png"),
+                Some(std::path::PathBuf::from("/abs/a.png"))
+            );
+            if let Some(home) = home_dir() {
+                assert_eq!(resolve_image_path("~/pics/a.png"), Some(home.join("pics/a.png")));
+            }
+        }
+
+        #[test]
+        fn halfblock_lines_match_dimensions() {
+            // A 4-wide, 6-tall image at width 4 → 4 spans/line, 3 lines (6px/2).
+            let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                4,
+                6,
+                image::Rgba([10, 20, 30, 255]),
+            ));
+            let lines = image_to_halfblock_lines(&img, 4, 24);
+            assert_eq!(lines.len(), 3);
+            assert!(lines.iter().all(|l| l.spans.len() == 4));
+            // Opaque pixels → a half-block glyph carrying the color.
+            assert_eq!(lines[0].spans[0].content.as_ref(), "▀");
+            assert_eq!(lines[0].spans[0].style.fg, Some(Color::Rgb(10, 20, 30)));
+        }
+    }
 }
 
 fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
@@ -2102,6 +3126,95 @@ mod tests {
     }
 
     #[test]
+    fn source_line_rows_map_each_line_to_its_output_row() {
+        // Three paragraphs separated by blank lines (5 source lines total).
+        let src = "alpha\n\nbravo\n\ncharlie";
+        let out = render_full(src, 80, &PreviewOptions::default(), &Default::default());
+        let text = rendered_text(&out.lines);
+
+        // One dense entry per source line, monotonic non-decreasing.
+        assert_eq!(out.source_line_rows.len(), 5);
+        assert!(out.source_line_rows.windows(2).all(|w| w[0] <= w[1]));
+
+        // The mapped row for each content line actually holds that line's text.
+        assert!(text[out.source_line_rows[0]].contains("alpha"));
+        assert!(text[out.source_line_rows[2]].contains("bravo"));
+        assert!(text[out.source_line_rows[4]].contains("charlie"));
+    }
+
+    #[test]
+    fn headings_collected_with_level_text_and_row() {
+        let src = "# Title\n\nintro\n\n## Section\n\nbody";
+        let out = render_full(src, 80, &PreviewOptions::default(), &Default::default());
+        let text = rendered_text(&out.lines);
+
+        assert_eq!(out.headings.len(), 2);
+        assert_eq!((out.headings[0].level, out.headings[0].text.as_str()), (1, "Title"));
+        assert_eq!((out.headings[1].level, out.headings[1].text.as_str()), (2, "Section"));
+
+        // Each heading's recorded row holds its text.
+        assert!(text[out.headings[0].row].contains("Title"));
+        assert!(text[out.headings[1].row].contains("Section"));
+    }
+
+    #[test]
+    fn superscript_and_subscript_render_unicode() {
+        let opts = PreviewOptions::default(); // sup_sub defaults on
+        let text = rendered_text(&render("x^2^ and H~2~O", 80, &opts)).join("\n");
+        assert!(text.contains("x²"), "superscript: {text}");
+        assert!(text.contains("H₂O"), "subscript: {text}");
+
+        // A caret with no closing partner stays literal (no false transform).
+        let stray = rendered_text(&render("3 ^ 4 caret", 80, &opts)).join("\n");
+        assert!(stray.contains("3 ^ 4 caret"), "stray caret: {stray}");
+
+        // Disabling the toggle leaves the markers untouched.
+        let off = PreviewOptions { sup_sub: false, ..Default::default() };
+        let raw = rendered_text(&render("x^2^", 80, &off)).join("\n");
+        assert!(raw.contains("x^2^"), "disabled: {raw}");
+    }
+
+    #[test]
+    fn latex_to_unicode_handles_symbols_scripts_and_frac() {
+        assert_eq!(latex_to_unicode("\\frac{a}{b}"), "a⁄b");
+        assert_eq!(latex_to_unicode("x_i"), "xᵢ");
+        assert_eq!(latex_to_unicode("\\sum_{i=1}^{n}"), "∑ᵢ₌₁ⁿ");
+        assert_eq!(latex_to_unicode("\\theta + \\pi"), "θ + π");
+    }
+
+    #[test]
+    fn math_renders_when_enabled_and_preserves_prices() {
+        let opts = PreviewOptions { math: true, ..Default::default() };
+        let text = rendered_text(&render("Let $E = mc^2$ and $\\alpha+\\beta$.", 80, &opts)).join("\n");
+        assert!(text.contains("E = mc²"), "math: {text}");
+        assert!(text.contains("α+β"), "greek: {text}");
+
+        // A `$` pair with a space before the closing `$` is not math (prices).
+        let money = rendered_text(&render("Costs $5 and $10 now.", 80, &opts)).join("\n");
+        assert!(money.contains("$5 and $10"), "prices preserved: {money}");
+    }
+
+    #[test]
+    fn math_off_by_default_leaves_dollars_literal() {
+        let text = rendered_text(&render("$E=mc^2$", 80, &PreviewOptions::default())).join("\n");
+        assert!(text.contains("$E=mc^2$"), "math off: {text}");
+    }
+
+    #[test]
+    fn mermaid_block_renders_diagram_when_on_else_source() {
+        let src = "```mermaid\ngraph TD\n A[Start] --> B[End]\n```";
+        // Default (mermaid on) → ASCII diagram, raw source hidden.
+        let on = rendered_text(&render(src, 60, &PreviewOptions::default())).join("\n");
+        assert!(on.contains("Start") && on.contains('┌'), "diagram: {on}");
+        assert!(!on.contains("graph TD"), "source hidden: {on}");
+
+        // Off → the raw mermaid source is shown as a normal code block.
+        let opts = PreviewOptions { mermaid: false, ..Default::default() };
+        let off = rendered_text(&render(src, 60, &opts)).join("\n");
+        assert!(off.contains("graph TD"), "source shown: {off}");
+    }
+
+    #[test]
     fn wikilinks_off_keeps_literal_text() {
         // With wikilinks disabled, `[[Foo]]` must survive as literal text.
         let lines = render("see [[Foo Bar]] here", 80, &PreviewOptions::default());
@@ -2116,7 +3229,7 @@ mod tests {
             ..Default::default()
         };
         let targets = link_targets(&["Foo Bar"]);
-        let (lines, _) = render_full("see [[Foo Bar]] here", 80, &opts, &targets);
+        let lines = render_full("see [[Foo Bar]] here", 80, &opts, &targets).lines;
         let text = rendered_text(&lines).join("\n");
         assert!(text.contains("see Foo Bar here"), "got: {text}");
         assert!(!text.contains("[["), "brackets should be consumed: {text}");
@@ -2137,7 +3250,7 @@ mod tests {
         };
         // "Live" exists; "Ghost" does not.
         let targets = link_targets(&["Live"]);
-        let (lines, _) = render_full("[[Live|shown]] and [[Ghost]]", 80, &opts, &targets);
+        let lines = render_full("[[Live|shown]] and [[Ghost]]", 80, &opts, &targets).lines;
         let text = rendered_text(&lines).join("\n");
         assert!(text.contains("shown"), "alias display: {text}");
         assert!(!text.contains("Live"), "alias replaces target: {text}");
@@ -2152,7 +3265,7 @@ mod tests {
             ..Default::default()
         };
         let targets = link_targets(&["One", "Two"]);
-        let (lines, _) = render_full("[[One]] then [[Two]]", 80, &opts, &targets);
+        let lines = render_full("[[One]] then [[Two]]", 80, &opts, &targets).lines;
         let spans: Vec<&Span> = lines.iter().flat_map(|l| l.spans.iter()).collect();
         let one = spans.iter().find(|s| s.content.as_ref() == "One").unwrap();
         let two = spans.iter().find(|s| s.content.as_ref() == "Two").unwrap();
@@ -2173,12 +3286,13 @@ mod tests {
             ..Default::default()
         };
         let targets = link_targets(&["Foo"]);
-        let (lines, _) = render_full(
+        let lines = render_full(
             "| a | b |\n|---|---|\n| [[Foo]] | [[Bar|baz]] |",
             80,
             &opts,
             &targets,
-        );
+        )
+        .lines;
         let text = rendered_text(&lines).join("\n");
         // No stray sentinel chars; display text shown in the cell.
         assert!(text.contains("Foo"), "got: {text}");
@@ -2389,6 +3503,24 @@ mod tests {
         let text = rendered_text(&lines).join("\n");
         assert!(text.contains("Warning"));
         assert!(text.contains("Watch out here."));
+    }
+
+    #[test]
+    fn github_alert_renders_as_callout() {
+        let source = "> [!WARNING]\n> Watch out here.\n> Second line.";
+        let text = rendered_text(&render(source, 80, &PreviewOptions::default())).join("\n");
+        assert!(text.contains("Warning"), "label: {text}");
+        assert!(text.contains("Watch out here."), "body: {text}");
+        assert!(text.contains("Second line."), "multi-line body: {text}");
+        assert!(!text.contains("[!WARNING]"), "marker consumed: {text}");
+    }
+
+    #[test]
+    fn plain_blockquote_is_not_a_callout() {
+        let text = rendered_text(&render("> just a quote", 80, &PreviewOptions::default())).join("\n");
+        assert!(text.contains("just a quote"));
+        // No callout label/icon was injected.
+        assert!(!text.contains("Note") && !text.contains('ℹ'), "got: {text}");
     }
 
     #[test]

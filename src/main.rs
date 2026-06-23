@@ -493,6 +493,7 @@ async fn handle_event(
             handle_conflict_event(event, state, storage, persist_tx).await
         }
         AppView::Ask => handle_ask_view_event(event, state, storage, ask_tx).await,
+        AppView::PreviewSearch => handle_preview_search_event(event, state).await,
         AppView::List | AppView::Preview => {
             handle_command_event(event, state, storage, persist_tx, sync_tx).await
         }
@@ -509,6 +510,20 @@ async fn handle_command_event(
     sync_tx: &Option<mpsc::Sender<SyncCommand>>,
 ) -> Result<bool> {
     if state.view == AppView::Preview {
+        // The outline overlay captures navigation while it is open.
+        if state.outline_open {
+            match event {
+                AppEvent::Up | AppEvent::Char('k') => state.outline_move(-1),
+                AppEvent::Down | AppEvent::Char('j') => state.outline_move(1),
+                AppEvent::Confirm => {
+                    state.jump_to_selected_heading();
+                    state.close_outline();
+                }
+                AppEvent::Cancel => state.close_outline(),
+                _ => {}
+            }
+            return Ok(false);
+        }
         match event {
             AppEvent::Up => state.scroll_preview_lines(-1),
             AppEvent::Down => state.scroll_preview_lines(1),
@@ -530,6 +545,16 @@ async fn handle_command_event(
                 'k' => state.scroll_preview_lines(-1),
                 'g' => state.reset_preview_scroll(),
                 'G' => state.scroll_preview_to_bottom(),
+                'o' => state.open_outline(),
+                '/' => {
+                    state.open_preview_search();
+                    state.set_status("Find — type to search · Enter keep · Esc clear");
+                }
+                'n' => state.preview_search_step(1),
+                'N' => state.preview_search_step(-1),
+                'z' => state.toggle_fold_at_scroll(),
+                'Z' => state.toggle_fold_all(),
+                'w' => state.toggle_zen_mode(),
                 '?' => open_help(state),
                 ':' => state.open_palette(),
                 ']' => focus_next_code_block(state),
@@ -557,7 +582,7 @@ async fn handle_command_event(
                 state.view = AppView::Preview;
                 state.clear_code_focus();
                 state.set_status(
-                    "PREVIEW — j/k scroll · ]/[ focus · Enter open link · y copy · x run · Esc back",
+                    "PREVIEW — j/k scroll · o outline · / find · z fold · w zen · ]/[ focus · Enter link · y copy · Esc back",
                 );
             } else {
                 state.set_status("No note selected");
@@ -603,7 +628,7 @@ async fn open_note_in_editor(state: &mut AppState, storage: &SqliteStorage, note
             state.wiki_complete = None;
             state.reset_edit_history();
             state.view = AppView::Editor;
-            state.set_status("EDITOR — Ctrl+S save, Esc discard");
+            state.set_status("EDITOR — Ctrl+S save · Ctrl+P preview · Esc discard");
         }
         Ok(None) => state.set_status("Note no longer exists"),
         Err(e) => state.set_status(format!("Error: {}", e)),
@@ -658,7 +683,7 @@ async fn run_command(
                         state.cursor_pos = state.body_buffer.len();
                         state.reset_edit_history();
                         state.view = AppView::Editor;
-                        state.set_status("EDITOR — Ctrl+S save, Esc discard");
+                        state.set_status("EDITOR — Ctrl+S save · Ctrl+P preview · Esc discard");
                     }
                     Ok(None) => state.set_status("Note no longer exists"),
                     Err(e) => state.set_status(format!("Error: {}", e)),
@@ -1743,6 +1768,15 @@ async fn handle_editor_event(
             state.open_editor_search();
             state.set_status("Find — type to search, Enter/↓ next, ↑ prev, Esc done");
         }
+        AppEvent::TogglePreview => {
+            state.editor_preview_split = !state.editor_preview_split;
+            if state.editor_preview_split {
+                state.editor_preview_scroll.set(0);
+                state.set_status("Live preview on — Ctrl+P to hide");
+            } else {
+                state.set_status("Live preview off — Ctrl+P to show");
+            }
+        }
         AppEvent::Home => {
             state.break_edit_group();
             state.cursor_line_start();
@@ -1824,6 +1858,28 @@ async fn handle_editor_event(
     Ok(false)
 }
 
+/// Handle events while typing a find-in-preview query. Matches are recomputed
+/// against the rendered preview each frame; Up/Down (or n/N after confirming)
+/// step through them.
+async fn handle_preview_search_event(event: AppEvent, state: &mut AppState) -> Result<bool> {
+    match event {
+        AppEvent::Char(c) => state.preview_search_input(c),
+        AppEvent::Backspace => state.preview_search_backspace(),
+        AppEvent::Confirm => {
+            state.confirm_preview_search();
+            state.set_status("Find — n next · N prev · / again · Esc clear");
+        }
+        AppEvent::Cancel => {
+            state.cancel_preview_search();
+            state.set_status("Find cleared");
+        }
+        AppEvent::Down => state.preview_search_step(1),
+        AppEvent::Up => state.preview_search_step(-1),
+        _ => {}
+    }
+    Ok(false)
+}
+
 /// Handle events in the in-note search (Find) view.
 async fn handle_editor_search_event(event: AppEvent, state: &mut AppState) -> Result<bool> {
     match event {
@@ -1844,7 +1900,7 @@ async fn handle_editor_search_event(event: AppEvent, state: &mut AppState) -> Re
         AppEvent::Cancel => {
             // Return to editor, cursor stays at the match position
             state.view = AppView::Editor;
-            state.set_status("EDITOR — Ctrl+S save, Esc discard");
+            state.set_status("EDITOR — Ctrl+S save · Ctrl+P preview · Esc discard");
         }
         _ => {}
     }

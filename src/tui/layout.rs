@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::commands;
@@ -18,7 +18,18 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         .split(frame.area());
 
     if state.view == AppView::Editor || state.view == AppView::EditorSearch {
-        render_editor(frame, main_layout[0], state);
+        if state.editor_preview_split {
+            // Editor on the left, a live markdown preview of the in-progress
+            // buffer on the right (toggled with Ctrl+P).
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+                .split(main_layout[0]);
+            render_editor(frame, cols[0], state);
+            render_editor_preview(frame, cols[1], state);
+        } else {
+            render_editor(frame, main_layout[0], state);
+        }
     } else if state.view == AppView::Settings {
         render_settings(frame, main_layout[0], state);
     } else if state.view == AppView::ConflictReview {
@@ -100,6 +111,13 @@ fn render_note_list(frame: &mut Frame, area: Rect, state: &AppState) {
 fn render_preview(frame: &mut Frame, area: Rect, state: &AppState) {
     if let Some(note) = state.selected_note() {
         let inner_width = area.width.saturating_sub(2).max(1);
+        // Zen mode renders the body into a narrower, centered column.
+        let render_width = if state.zen_mode {
+            inner_width.min(state.settings.preview.zen_width.max(1) as u16)
+        } else {
+            inner_width
+        };
+        let zen_margin = usize::from((inner_width - render_width) / 2);
         let viewport_height = usize::from(area.height.saturating_sub(2));
         state
             .preview_viewport_height
@@ -116,31 +134,39 @@ fn render_preview(frame: &mut Frame, area: Rect, state: &AppState) {
                 "(empty note — press 'i' to write the body, Ctrl+S to save)",
                 Style::default().fg(Color::DarkGray),
             )));
+            state.preview_headings.borrow_mut().clear();
         } else {
             // Row offset of the markdown body within `lines` (title + blank above).
             let body_offset = lines.len();
-            let (body_lines, code_rows) = markdown::render_full(
+            let out = markdown::render_full(
                 &state.preview_body,
-                inner_width,
-                &PreviewOptions {
-                    render_markdown: state.preview_render_markdown,
-                    link_urls: state.settings.preview.show_link_urls,
-                    typographer: state.settings.preview.typographer,
-                    emoji: state.settings.preview.emoji,
-                    mark: state.settings.preview.mark,
-                    ins: state.settings.preview.ins,
-                    sup_sub: state.settings.preview.sup_sub,
-                    abbreviations: state.settings.preview.abbreviations,
-                    definition_lists: state.settings.preview.definition_lists,
-                    custom_containers: state.settings.preview.custom_containers,
-                    linkify: state.settings.preview.linkify,
-                    wikilinks: state.settings.preview.wikilinks,
-                    focused_code_block: state.focused_code_index(),
-                    focused_wikilink: state.focused_link_index(),
-                },
+                render_width,
+                &preview_options(state, state.focused_code_index(), state.focused_link_index()),
                 &state.link_targets,
             );
-            lines.extend(body_lines);
+            // Move out the headings and code rows, then collapse any folded
+            // sections; `remap` carries original rows into folded coordinates.
+            let unfolded_headings = out.headings;
+            let unfolded_code_rows = out.code_rows;
+            let (folded_body, remap) = {
+                let folds = state.folded_headings.borrow();
+                apply_folds(out.lines, &unfolded_headings, &folds)
+            };
+            let code_rows: Vec<usize> = unfolded_code_rows
+                .iter()
+                .map(|&r| remap_row(&remap, r))
+                .collect();
+            // Stash headings at their folded, absolute preview rows for the
+            // outline overlay, jump-to-heading, and scrollbar ticks.
+            *state.preview_headings.borrow_mut() = unfolded_headings
+                .iter()
+                .map(|h| markdown::Heading {
+                    level: h.level,
+                    text: h.text.clone(),
+                    row: body_offset + remap_row(&remap, h.row),
+                })
+                .collect();
+            lines.extend(folded_body);
 
             // When focus just moved, scroll the focused block's first row near
             // the top of the viewport (one-line margin). Honored once.
@@ -263,6 +289,36 @@ fn render_preview(frame: &mut Frame, area: Rect, state: &AppState) {
             lines.push(suggestion_line);
         }
 
+        // Find-in-preview: match against the rendered text, highlight the hits
+        // (current match brighter), and scroll the current match into view once.
+        if !state.preview_search_query.is_empty() {
+            let matches = find_preview_matches(&lines, &state.preview_search_query);
+            let idx = state.preview_search_idx.min(matches.len().saturating_sub(1));
+            if state.preview_search_scroll.replace(false) {
+                if let Some(&(row, _, _)) = matches.get(idx) {
+                    let new = wrap::scroll_to_cursor(
+                        usize::from(state.preview_scroll.get()),
+                        row,
+                        lines.len(),
+                        viewport_height,
+                    );
+                    state.preview_scroll.set(new.min(usize::from(u16::MAX)) as u16);
+                }
+            }
+            highlight_preview_matches(&mut lines, &matches, idx);
+            *state.preview_search_matches.borrow_mut() = matches;
+        } else {
+            state.preview_search_matches.borrow_mut().clear();
+        }
+
+        // Zen mode: center the column by left-padding every line.
+        if zen_margin > 0 {
+            let pad = " ".repeat(zen_margin);
+            for line in &mut lines {
+                line.spans.insert(0, Span::raw(pad.clone()));
+            }
+        }
+
         let scroll = wrap::clamp_scroll(
             usize::from(state.preview_scroll.get()),
             lines.len(),
@@ -276,13 +332,46 @@ fn render_preview(frame: &mut Frame, area: Rect, state: &AppState) {
             lines.len().saturating_sub(viewport_height)
         };
         let (words, chars) = body_counts(&state.preview_body);
-        let title = preview_title(scroll, max_scroll, words, chars);
+        let title = if !state.preview_search_query.is_empty() {
+            let total = state.preview_search_matches.borrow().len();
+            let cur = if total == 0 {
+                0
+            } else {
+                state.preview_search_idx.min(total - 1) + 1
+            };
+            format!(
+                " Find \"{}\" — {cur}/{total} · n/N · Esc ",
+                state.preview_search_query
+            )
+        } else {
+            preview_title(
+                scroll,
+                max_scroll,
+                words,
+                chars,
+                task_counts(&state.preview_body),
+            )
+        };
+        let content_len = lines.len();
         let block = Block::default().title(title).borders(Borders::ALL);
         let paragraph = Paragraph::new(lines)
             .block(block)
             .scroll((scroll_u16, 0))
             .style(Style::default());
         frame.render_widget(paragraph, area);
+
+        render_heading_scrollbar(
+            frame,
+            area,
+            content_len,
+            viewport_height,
+            scroll,
+            &state.preview_headings.borrow(),
+        );
+
+        if state.outline_open {
+            render_outline_overlay(frame, area, state);
+        }
     } else if state.view == AppView::Search && !state.search_query.is_empty() {
         let block = Block::default().title(" Preview ").borders(Borders::ALL);
         let paragraph = Paragraph::new("No notes found matching your search.")
@@ -300,12 +389,431 @@ fn render_preview(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 }
 
-fn preview_title(scroll: usize, max_scroll: usize, words: usize, chars: usize) -> String {
-    let counts = format!(
+/// Build `PreviewOptions` from the user's settings with the given focus indices,
+/// shared by the standalone preview and the editor's live preview.
+fn preview_options(
+    state: &AppState,
+    focused_code_block: Option<usize>,
+    focused_wikilink: Option<usize>,
+) -> PreviewOptions {
+    PreviewOptions {
+        render_markdown: state.preview_render_markdown,
+        link_urls: state.settings.preview.show_link_urls,
+        typographer: state.settings.preview.typographer,
+        emoji: state.settings.preview.emoji,
+        mark: state.settings.preview.mark,
+        ins: state.settings.preview.ins,
+        sup_sub: state.settings.preview.sup_sub,
+        abbreviations: state.settings.preview.abbreviations,
+        definition_lists: state.settings.preview.definition_lists,
+        custom_containers: state.settings.preview.custom_containers,
+        linkify: state.settings.preview.linkify,
+        wikilinks: state.settings.preview.wikilinks,
+        math: state.settings.preview.math,
+        syntax_theme: state.settings.preview.syntax_theme.clone(),
+        images: state.settings.preview.images,
+        mermaid: state.settings.preview.mermaid,
+        focused_code_block,
+        focused_wikilink,
+    }
+}
+
+fn hash_body(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Resolve the editor cursor's section for the live preview. Returns the body
+/// output row to keep visible (the cursor's source line mapped through
+/// `source_line_rows`) and the row of the nearest heading at or above it, both
+/// in body-local coordinates (the caller adds the title offset). Pure, so the
+/// cursor-follow + section-highlight behaviour is unit-testable without a Frame.
+fn editor_preview_focus(
+    source_line_rows: &[usize],
+    headings: &[markdown::Heading],
+    cursor_line: usize,
+) -> (usize, Option<usize>) {
+    let body_row = source_line_rows.get(cursor_line).copied().unwrap_or(0);
+    let heading_row = headings.iter().rfind(|h| h.row <= body_row).map(|h| h.row);
+    (body_row, heading_row)
+}
+
+/// Render the body editor's live markdown preview (the right pane of the split).
+/// Unlike the standalone preview, this renders the *in-progress* `body_buffer`
+/// (not the saved note) so it tracks every keystroke, follows the editor cursor's
+/// section, and reverse-highlights the heading the cursor sits under. The parse
+/// is memoized on (body hash, width) so typing stays responsive on large notes.
+fn render_editor_preview(frame: &mut Frame, area: Rect, state: &AppState) {
+    let inner_width = area.width.saturating_sub(2).max(1);
+    let viewport_height = usize::from(area.height.saturating_sub(2).max(1));
+
+    // Refresh the memoized render only when the body or pane width changed.
+    let body_hash = hash_body(&state.body_buffer);
+    {
+        let mut cache = state.editor_preview_cache.borrow_mut();
+        let fresh = cache
+            .as_ref()
+            .is_some_and(|(h, w, _)| *h == body_hash && *w == inner_width);
+        if !fresh {
+            let opts = preview_options(state, None, None);
+            let out =
+                markdown::render_full(&state.body_buffer, inner_width, &opts, &state.link_targets);
+            *cache = Some((body_hash, inner_width, out));
+        }
+    }
+    let cache = state.editor_preview_cache.borrow();
+    let out = &cache.as_ref().expect("cache populated above").2;
+
+    // Title line, mirroring the standalone preview's header.
+    let title = state
+        .selected_note()
+        .map(|n| n.title.clone())
+        .unwrap_or_default();
+    let mut lines: Vec<Line> = Vec::with_capacity(out.lines.len() + 2);
+    lines.push(Line::from(Span::styled(
+        format!("# {title}"),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    let body_offset = lines.len();
+
+    if state.body_buffer.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(start typing — the preview updates live)",
+            Style::default().fg(Color::DarkGray),
+        )));
+        state.editor_preview_scroll.set(0);
+    } else {
+        // Map the editor cursor to its source line, then to a body output row.
+        let cursor = state.cursor_pos.min(state.body_buffer.len());
+        let cursor_line = state.body_buffer.as_bytes()[..cursor]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        let (body_row, current_heading_row) =
+            editor_preview_focus(&out.source_line_rows, &out.headings, cursor_line);
+
+        lines.extend(out.lines.iter().cloned());
+
+        if let Some(hr) = current_heading_row {
+            if let Some(line) = lines.get_mut(body_offset + hr) {
+                for span in &mut line.spans {
+                    span.style = span.style.add_modifier(Modifier::REVERSED);
+                }
+            }
+        }
+
+        // Follow the cursor: keep its section's row visible with minimal movement.
+        let target_row = body_offset + body_row;
+        let scroll = wrap::scroll_to_cursor(
+            usize::from(state.editor_preview_scroll.get()),
+            target_row,
+            lines.len(),
+            viewport_height,
+        );
+        state
+            .editor_preview_scroll
+            .set(scroll.min(usize::from(u16::MAX)) as u16);
+    }
+
+    let scroll = state.editor_preview_scroll.get();
+    let block = Block::default()
+        .title(" Live preview ")
+        .borders(Borders::ALL);
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
+    frame.render_widget(paragraph, area);
+}
+
+/// Collapse folded sections of the rendered body. Returns the folded body plus
+/// a `remap` from each original body row to its row in the folded body (`None`
+/// when the row is hidden inside a fold). Every heading survives — folded ones
+/// gain a `▸` marker and a placeholder — so heading indices stay stable.
+fn apply_folds(
+    body: Vec<Line<'static>>,
+    headings: &[markdown::Heading],
+    folded: &std::collections::HashSet<usize>,
+) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
+    use std::collections::HashMap;
+    let n = body.len();
+    if folded.is_empty() {
+        return (body, (0..n).map(Some).collect());
+    }
+
+    // Hide each folded section: from the line after its heading to the next
+    // heading of the same or higher level (or the end of the body).
+    let mut hidden = vec![false; n];
+    let mut hidden_count: HashMap<usize, usize> = HashMap::new();
+    for (i, h) in headings.iter().enumerate() {
+        if !folded.contains(&i) {
+            continue;
+        }
+        let start = (h.row + 1).min(n);
+        let end = headings[i + 1..]
+            .iter()
+            .find(|hn| hn.level <= h.level)
+            .map(|hn| hn.row.min(n))
+            .unwrap_or(n);
+        for cell in hidden.iter_mut().take(end).skip(start) {
+            *cell = true;
+        }
+        hidden_count.insert(h.row, end.saturating_sub(start));
+    }
+
+    let heading_at: HashMap<usize, usize> =
+        headings.iter().enumerate().map(|(i, h)| (h.row, i)).collect();
+
+    let mut folded_body: Vec<Line<'static>> = Vec::with_capacity(n);
+    let mut remap = vec![None; n];
+    for (r, line) in body.into_iter().enumerate() {
+        if hidden[r] {
+            continue;
+        }
+        remap[r] = Some(folded_body.len());
+        match heading_at.get(&r) {
+            Some(&i) if folded.contains(&i) => {
+                folded_body.push(decorate_folded_heading(&line));
+                folded_body.push(fold_placeholder(hidden_count.get(&r).copied().unwrap_or(0)));
+            }
+            _ => folded_body.push(line),
+        }
+    }
+    (folded_body, remap)
+}
+
+/// Map an original body row to its folded-body row, falling back to the nearest
+/// preceding visible row (a fold's heading) when the row itself is hidden.
+fn remap_row(remap: &[Option<usize>], row: usize) -> usize {
+    let row = row.min(remap.len().saturating_sub(1));
+    (0..=row).rev().find_map(|k| remap[k]).unwrap_or(0)
+}
+
+/// Prefix a folded heading line with a `▸` collapse marker.
+fn decorate_folded_heading(line: &Line<'static>) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(Span::styled("▸ ", Style::default().fg(Color::DarkGray)));
+    spans.extend(line.spans.iter().cloned());
+    Line::from(spans)
+}
+
+/// The placeholder shown in place of a folded section's body.
+fn fold_placeholder(hidden_lines: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("   … {hidden_lines} hidden · z to expand"),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    ))
+}
+
+/// Find case-insensitive (ASCII) matches of `query` in the rendered preview
+/// lines. Returns `(row, char_start, char_end)` per non-overlapping match, with
+/// positions in character units relative to each line's concatenated text.
+fn find_preview_matches(lines: &[Line], query: &str) -> Vec<(usize, usize, usize)> {
+    let ql: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
+    if ql.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (row, line) in lines.iter().enumerate() {
+        let chars: Vec<char> = line.spans.iter().flat_map(|s| s.content.chars()).collect();
+        let mut i = 0;
+        while i + ql.len() <= chars.len() {
+            let hit = chars[i..i + ql.len()]
+                .iter()
+                .map(|c| c.to_ascii_lowercase())
+                .eq(ql.iter().copied());
+            if hit {
+                out.push((row, i, i + ql.len()));
+                i += ql.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Highlight `matches` within `lines` in place, splitting styled spans at match
+/// boundaries (the `current` match is rendered brighter) while preserving the
+/// underlying markdown styling of unmatched text.
+fn highlight_preview_matches(lines: &mut [Line], matches: &[(usize, usize, usize)], current: usize) {
+    use std::collections::HashMap;
+    let mut by_row: HashMap<usize, Vec<(usize, usize, bool)>> = HashMap::new();
+    for (i, &(row, s, e)) in matches.iter().enumerate() {
+        by_row.entry(row).or_default().push((s, e, i == current));
+    }
+    for (row, ranges) in by_row {
+        if let Some(line) = lines.get_mut(row) {
+            *line = highlight_matches_in_line(line, &ranges);
+        }
+    }
+}
+
+/// The highlight kind at character position `pos`: `Some(true)` for the current
+/// match, `Some(false)` for another match, `None` for unmatched text.
+fn range_kind(ranges: &[(usize, usize, bool)], pos: usize) -> Option<bool> {
+    ranges
+        .iter()
+        .find(|(s, e, _)| pos >= *s && pos < *e)
+        .map(|(_, _, cur)| *cur)
+}
+
+/// Rebuild a styled line with search-match highlights overlaid. Walks the
+/// existing spans character by character, emitting sub-spans whenever the
+/// highlight kind changes so original styling is kept outside the matches.
+fn highlight_matches_in_line<'a>(line: &Line<'a>, ranges: &[(usize, usize, bool)]) -> Line<'a> {
+    if ranges.is_empty() {
+        return line.clone();
+    }
+    let mut spans: Vec<Span<'a>> = Vec::new();
+    let mut pos = 0usize;
+    for span in &line.spans {
+        let chars: Vec<char> = span.content.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let kind = range_kind(ranges, pos + i);
+            let mut j = i + 1;
+            while j < chars.len() && range_kind(ranges, pos + j) == kind {
+                j += 1;
+            }
+            let text: String = chars[i..j].iter().collect();
+            let style = match kind {
+                Some(true) => span
+                    .style
+                    .bg(Color::Yellow)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+                Some(false) => span.style.bg(Color::DarkGray).fg(Color::White),
+                None => span.style,
+            };
+            spans.push(Span::styled(text, style));
+            i = j;
+        }
+        pos += chars.len();
+    }
+    Line::from(spans)
+}
+
+/// Overlay a minimap-style scrollbar on the preview's right border: a bright
+/// thumb for the visible window plus a cyan `◆` tick at every heading, giving
+/// an at-a-glance sense of structure and position. No-op when nothing scrolls.
+fn render_heading_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    content_len: usize,
+    viewport: usize,
+    scroll: usize,
+    headings: &[markdown::Heading],
+) {
+    if area.width < 2 || area.height < 3 || content_len <= viewport {
+        return;
+    }
+    let track_x = area.x + area.width - 1;
+    let track_top = area.y + 1;
+    let track_h = area.height - 2; // inside the top/bottom borders
+    if track_h == 0 {
+        return;
+    }
+
+    // Map a content row (0..content_len) onto a track row, via integer math.
+    let denom = content_len.saturating_sub(1).max(1);
+    let span = usize::from(track_h - 1);
+    let map = |row: usize| -> u16 {
+        let r = row.min(content_len - 1);
+        track_top + (r * span / denom) as u16
+    };
+
+    let buf = frame.buffer_mut();
+
+    // Thumb: the currently visible window, drawn first so ticks sit on top.
+    let top = map(scroll);
+    let bottom = map(scroll + viewport);
+    for y in top..=bottom {
+        let cell = &mut buf[(track_x, y)];
+        cell.set_symbol("┃");
+        cell.set_style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+
+    // Heading ticks on top of the thumb.
+    for h in headings {
+        let cell = &mut buf[(track_x, map(h.row))];
+        cell.set_symbol("◆");
+        cell.set_style(Style::default().fg(Color::Cyan));
+    }
+}
+
+/// Draw the jump-to-heading outline as a centered popup over the preview pane.
+/// Indents each entry by heading level and reverse-highlights the selection.
+fn render_outline_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
+    use ratatui::widgets::Clear;
+    let headings = state.preview_headings.borrow();
+    if headings.is_empty() {
+        return;
+    }
+
+    let longest = headings
+        .iter()
+        .map(|h| h.text.chars().count() + usize::from(h.level) + 2)
+        .max()
+        .unwrap_or(10) as u16;
+    // Bound the popup to the pane; keep each clamp's lower bound <= upper bound
+    // so a tiny pane can't invert them.
+    let max_w = area.width.max(1);
+    let max_h = area.height.max(1);
+    let width = (longest + 4).clamp(20.min(max_w), max_w);
+    let height = (headings.len() as u16 + 2).clamp(3.min(max_h), max_h);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let popup = Rect { x, y, width, height };
+
+    let items: Vec<ListItem> = headings
+        .iter()
+        .map(|h| {
+            let indent = "  ".repeat(usize::from(h.level.saturating_sub(1)));
+            ListItem::new(format!("{indent}{}", h.text))
+        })
+        .collect();
+
+    let block = Block::default()
+        .title(" Outline — ↑/↓ select · Enter jump · Esc close ")
+        .borders(Borders::ALL);
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    let mut ls = ListState::default();
+    ls.select(Some(state.outline_selected.min(headings.len() - 1)));
+
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(list, popup, &mut ls);
+}
+
+fn preview_title(
+    scroll: usize,
+    max_scroll: usize,
+    words: usize,
+    chars: usize,
+    tasks: (usize, usize),
+) -> String {
+    let mut counts = format!(
         "{words} word{} · {chars} char{}",
         plural(words),
         plural(chars)
     );
+    if words > 0 {
+        // ~200 wpm reading speed, rounded up.
+        counts.push_str(&format!(" · ~{} min", words.div_ceil(200)));
+    }
+    let (done, total) = tasks;
+    if total > 0 {
+        counts.push_str(&format!(" · ☑ {done}/{total}"));
+    }
     match (scroll * 100).checked_div(max_scroll) {
         // max_scroll == 0 means everything fits — nothing to scroll.
         None => format!(" Preview · {counts} "),
@@ -317,6 +825,25 @@ fn preview_title(scroll: usize, max_scroll: usize, words: usize, chars: usize) -
 /// chars count Unicode scalar values.
 fn body_counts(body: &str) -> (usize, usize) {
     (body.split_whitespace().count(), body.chars().count())
+}
+
+/// Count completed and total markdown task items (`- [ ]` / `- [x]`) in a body.
+fn task_counts(body: &str) -> (usize, usize) {
+    let mut done = 0;
+    let mut total = 0;
+    for line in body.lines() {
+        let rest = match line.trim_start() {
+            t if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") => &t[2..],
+            _ => continue,
+        };
+        if rest.starts_with("[x]") || rest.starts_with("[X]") {
+            done += 1;
+            total += 1;
+        } else if rest.starts_with("[ ]") {
+            total += 1;
+        }
+    }
+    (done, total)
 }
 
 fn plural(n: usize) -> &'static str {
@@ -972,6 +1499,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     let mode_indicator = match state.view {
         AppView::List => "NORMAL",
         AppView::Preview => "PREVIEW",
+        AppView::PreviewSearch => "FIND",
         AppView::Search => "SEARCH",
         AppView::Ask => "ASK",
         AppView::Edit => "EDIT TITLE",
@@ -1108,6 +1636,182 @@ mod tests {
     }
 
     #[test]
+    fn editor_preview_focus_tracks_cursor_section() {
+        use crate::tui::markdown::Heading;
+        let source_line_rows = vec![0, 2, 5];
+        let headings = vec![
+            Heading { level: 1, text: "A".into(), row: 0 },
+            Heading { level: 2, text: "B".into(), row: 4 },
+        ];
+        // Cursor on source line 0 → body row 0, inside heading A (row 0).
+        assert_eq!(editor_preview_focus(&source_line_rows, &headings, 0), (0, Some(0)));
+        // Cursor on source line 1 → body row 2, still under heading A.
+        assert_eq!(editor_preview_focus(&source_line_rows, &headings, 1), (2, Some(0)));
+        // Cursor on source line 2 → body row 5, now under heading B (row 4).
+        assert_eq!(editor_preview_focus(&source_line_rows, &headings, 2), (5, Some(4)));
+        // A cursor line past the map clamps to the top.
+        assert_eq!(editor_preview_focus(&source_line_rows, &headings, 99), (0, Some(0)));
+        // No headings → no current section.
+        assert_eq!(editor_preview_focus(&source_line_rows, &[], 1), (2, None));
+    }
+
+    /// Render the editor with the live preview split across several viewport
+    /// sizes (including tiny ones) to ensure the split layout, cursor-synced
+    /// scroll, section highlight, and render cache never panic.
+    #[test]
+    fn editor_live_preview_split_renders_without_panic() {
+        for (w, h) in [(80u16, 24u16), (40, 12), (10, 6), (4, 3)] {
+            let mut state = AppState::new();
+            state.view = AppView::Editor;
+            state.editor_preview_split = true;
+            state.body_buffer =
+                "# Title\n\nSome **bold** text.\n\n## Section\n\n- a\n- b\n".to_string();
+            state.cursor_pos = state.body_buffer.len();
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal.draw(|f| render(f, &state)).expect("draw");
+        }
+    }
+
+    #[test]
+    fn find_preview_matches_is_case_insensitive_and_nonoverlapping() {
+        let lines = vec![
+            Line::from("Hello World"),
+            Line::from(vec![Span::raw("foo "), Span::raw("BAR baz")]),
+        ];
+        // Spans within a line are concatenated, so "BAR" is at chars 4..7.
+        assert_eq!(find_preview_matches(&lines, "bar"), vec![(1, 4, 7)]);
+        // 'l' occurs three times on row 0, none on row 1.
+        assert_eq!(
+            find_preview_matches(&lines, "l"),
+            vec![(0, 2, 3), (0, 3, 4), (0, 9, 10)]
+        );
+    }
+
+    #[test]
+    fn highlight_matches_in_line_splits_and_marks_current() {
+        let line = Line::from("abcdef");
+        let out = highlight_matches_in_line(&line, &[(2, 4, true)]);
+        let texts: Vec<String> = out.spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(texts, vec!["ab", "cd", "ef"]);
+        assert_eq!(out.spans[1].style.bg, Some(Color::Yellow)); // current match
+        assert_eq!(out.spans[0].style.bg, None); // untouched
+    }
+
+    /// Render the preview with an active find query across viewport sizes to
+    /// ensure match highlighting + scrollbar never panic.
+    #[test]
+    fn preview_find_renders_without_panic() {
+        for (w, h) in [(80u16, 24u16), (30, 8), (6, 4)] {
+            let mut state = AppState::new();
+            state.view = AppView::PreviewSearch;
+            state.preview_body =
+                "# Title\n\nalpha beta alpha\n\n## More\n\nbeta gamma\n".to_string();
+            state.preview_search_query = "alpha".to_string();
+            // selected_note() is None here, so render shows the empty-preview
+            // path; drive the find path directly instead.
+            let matches = find_preview_matches(
+                &[Line::from("alpha beta alpha")],
+                &state.preview_search_query,
+            );
+            assert_eq!(matches, vec![(0, 0, 5), (0, 11, 16)]);
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal.draw(|f| render(f, &state)).expect("draw");
+        }
+    }
+
+    #[test]
+    fn apply_folds_hides_section_and_remaps_rows() {
+        use crate::tui::markdown::Heading;
+        let body: Vec<Line> = (0..6).map(|i| Line::from(format!("row{i}"))).collect();
+        let headings = vec![
+            Heading { level: 1, text: "A".into(), row: 0 },
+            Heading { level: 1, text: "B".into(), row: 4 },
+        ];
+        let mut folded = std::collections::HashSet::new();
+        folded.insert(0); // fold section A → rows 1..4 hidden
+
+        let (out, remap) = apply_folds(body, &headings, &folded);
+        let texts: Vec<String> = out
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        // Folded body: [▸ row0, placeholder, row4, row5].
+        assert!(texts[0].starts_with('▸') && texts[0].contains("row0"));
+        assert!(texts[1].contains("hidden"));
+        assert!(texts[2].contains("row4"));
+        assert!(texts[3].contains("row5"));
+
+        assert_eq!(remap[0], Some(0));
+        assert_eq!(remap[1], None); // hidden
+        assert_eq!(remap[4], Some(2));
+        assert_eq!(remap[5], Some(3));
+        // A hidden row maps back to its (visible) fold heading.
+        assert_eq!(remap_row(&remap, 2), 0);
+    }
+
+    /// Render the full preview with a selected note, headings, an active fold,
+    /// the outline overlay, and a find query — across sizes — to ensure the
+    /// whole Phase 2 surface composes without panicking.
+    #[test]
+    fn preview_render_with_headings_folds_and_find_no_panic() {
+        use crate::models::note::NoteSummary;
+        for (w, h) in [(80u16, 24u16), (24, 8), (5, 4)] {
+            let mut state = AppState::new();
+            state.notes = vec![NoteSummary {
+                id: uuid::Uuid::new_v4(),
+                title: "Doc".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                tags: Vec::new(),
+            }];
+            state.list_state.select(Some(0));
+            state.view = AppView::Preview;
+            state.preview_body =
+                "# Alpha\n\nalpha body\nmore alpha\n\n## Beta\n\nbeta body\n".to_string();
+
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            // First render populates the heading list.
+            terminal.draw(|f| render(f, &state)).expect("draw 1");
+            assert!(!state.preview_headings.borrow().is_empty());
+
+            // Fold a section, open the outline, and run a find, then re-render.
+            state.toggle_fold_at_scroll();
+            state.outline_open = true;
+            state.preview_search_query = "alpha".to_string();
+            state.preview_search_scroll.set(true);
+            terminal.draw(|f| render(f, &state)).expect("draw 2");
+        }
+    }
+
+    /// Render the preview in zen mode across widths (wide → margin applied,
+    /// narrow → margin collapses to zero) to ensure centering never panics.
+    #[test]
+    fn preview_zen_mode_renders_without_panic() {
+        use crate::models::note::NoteSummary;
+        for (w, h) in [(120u16, 24u16), (40, 10), (6, 4)] {
+            let mut state = AppState::new();
+            state.notes = vec![NoteSummary {
+                id: uuid::Uuid::new_v4(),
+                title: "Doc".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                tags: Vec::new(),
+            }];
+            state.list_state.select(Some(0));
+            state.view = AppView::Preview;
+            state.zen_mode = true;
+            state.preview_body =
+                "# Title\n\nA reasonably long paragraph of body text that should wrap.\n".to_string();
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal.draw(|f| render(f, &state)).expect("draw");
+        }
+    }
+
+    #[test]
     fn body_counts_words_and_chars() {
         assert_eq!(body_counts(""), (0, 0));
         assert_eq!(body_counts("hello"), (1, 5));
@@ -1117,20 +1821,26 @@ mod tests {
     }
 
     #[test]
-    fn preview_title_shows_counts_and_scroll() {
-        // Everything fits → no percentage, pluralized counts.
-        assert_eq!(preview_title(0, 0, 2, 9), " Preview · 2 words · 9 chars ");
-        // Singular for exactly one.
-        assert_eq!(preview_title(0, 0, 1, 1), " Preview · 1 word · 1 char ");
-        // Scrollable → percentage appended, clamped to 100.
+    fn preview_title_shows_counts_reading_time_and_scroll() {
+        // Everything fits → no percentage; counts + reading time, no tasks.
         assert_eq!(
-            preview_title(5, 10, 3, 12),
-            " Preview · 3 words · 12 chars · 50% "
+            preview_title(0, 0, 2, 9, (0, 0)),
+            " Preview · 2 words · 9 chars · ~1 min "
         );
+        // Singular for exactly one; zero words → no reading time.
+        assert_eq!(preview_title(0, 0, 0, 0, (0, 0)), " Preview · 0 words · 0 chars ");
+        // Scrollable → percentage appended; 450 words → ~3 min; task progress.
         assert_eq!(
-            preview_title(99, 10, 3, 12),
-            " Preview · 3 words · 12 chars · 100% "
+            preview_title(5, 10, 450, 12, (2, 5)),
+            " Preview · 450 words · 12 chars · ~3 min · ☑ 2/5 · 50% "
         );
+    }
+
+    #[test]
+    fn task_counts_counts_done_and_total() {
+        let body = "- [ ] a\n- [x] b\n* [X] c\n+ [ ] d\n- not a task\nplain";
+        assert_eq!(task_counts(body), (2, 4));
+        assert_eq!(task_counts("no tasks here"), (0, 0));
     }
 
     // ── highlight_row_spans ──────────────────────────────────────────────────

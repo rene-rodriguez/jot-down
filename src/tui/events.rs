@@ -54,6 +54,8 @@ pub enum AppEvent {
     Backspace,
     /// Open in-note find (Ctrl+F).
     Find,
+    /// Toggle the editor's live markdown preview split (Ctrl+P).
+    TogglePreview,
     /// No-op / unmapped key, also used as a periodic tick.
     Tick,
 }
@@ -112,6 +114,9 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers) -> AppEvent {
         }
         KeyCode::Char('f') | KeyCode::Char('F') if modifiers.contains(KeyModifiers::CONTROL) => {
             AppEvent::Find
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') if modifiers.contains(KeyModifiers::CONTROL) => {
+            AppEvent::TogglePreview
         }
         KeyCode::Left if modifiers.contains(KeyModifiers::CONTROL) => AppEvent::WordLeft,
         KeyCode::Right if modifiers.contains(KeyModifiers::CONTROL) => AppEvent::WordRight,
@@ -183,6 +188,19 @@ mod tests {
         assert_eq!(
             map_key(KeyCode::Char('z'), KeyModifiers::NONE),
             AppEvent::Char('z')
+        );
+    }
+
+    #[test]
+    fn maps_ctrl_p_to_toggle_preview() {
+        assert_eq!(
+            map_key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            AppEvent::TogglePreview
+        );
+        // A plain 'p' is still text, not a toggle.
+        assert_eq!(
+            map_key(KeyCode::Char('p'), KeyModifiers::NONE),
+            AppEvent::Char('p')
         );
     }
 }
