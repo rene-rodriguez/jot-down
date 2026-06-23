@@ -1,14 +1,16 @@
 PREFIX  ?= /usr/local
 BINDIR   = $(PREFIX)/bin
 BINARY   = jot-down
-FEATURES ?= default
+# Default build is batteries-included (ai + syntax-highlight + images). For a
+# minimal binary: make build CARGO_FLAGS="--no-default-features --features ai"
+CARGO_FLAGS ?=
 
 .PHONY: all build install uninstall clean
 
 all: build
 
 build:
-	cargo build --release --features $(FEATURES)
+	cargo build --release $(CARGO_FLAGS)
 
 install: build
 	install -d "$(BINDIR)"

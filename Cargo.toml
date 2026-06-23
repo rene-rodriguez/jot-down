@@ -5,11 +5,14 @@ edition = "2021"
 description = "A fast, offline-first terminal note-taking application"
 
 [features]
-default = ["ai"]
+# Batteries-included by default. For a minimal binary (no syntax highlighting,
+# no image decoding), build with: --no-default-features --features ai
+default = ["ai", "syntax-highlight", "images"]
 ai = ["dep:sqlite-vec", "dep:libsqlite3-sys", "dep:reqwest"]
+# Syntax highlighting for fenced code blocks (bundles syntect syntaxes/themes).
 syntax-highlight = ["dep:syntect"]
 # Inline images: decode local image files and render them as half-block cells
-# in the preview (works in any terminal). Off by default to keep the binary lean.
+# in the preview (works in any terminal).
 images = ["dep:image"]
 
 [dependencies]
